@@ -1,0 +1,11 @@
+.*\.git.*
+gmon\.out
+.*\.gcda
+.*\.gcno
+blib/.*
+Feersum.(?:o|bs|c)
+http_load.*
+.*\.patch
+Makefile
+Makefile\.old
+pm_to_blib
