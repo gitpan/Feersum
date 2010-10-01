@@ -1258,6 +1258,7 @@ feersum_init_tmpl_env(pTHX)
     hv_stores(e, "QUERY_STRING", newSVpvs(""));
 
     // anticipated headers
+    hv_stores(e, "CONTENT_TYPE", &PL_sv_placeholder);
     hv_stores(e, "HTTP_HOST", &PL_sv_placeholder);
     hv_stores(e, "HTTP_USER_AGENT", &PL_sv_placeholder);
     hv_stores(e, "HTTP_ACCEPT", &PL_sv_placeholder);
@@ -1367,38 +1368,46 @@ feersum_env(pTHX_ struct feer_conn *c)
         if (hdr->name == NULL && val != NULL) {
             trace("... multiline %.*s\n", hdr->value_len, hdr->value);
             sv_catpvn(val, hdr->value, hdr->value_len);
+            continue;
         }
-        else if (str_case_eq("content-length", 14, hdr->name, hdr->name_len)) {
+        else if (str_case_eq(
+            STR_WITH_LEN("content-length"), hdr->name, hdr->name_len))
+        {
             // content length shouldn't show up as HTTP_CONTENT_LENGTH but
             // as CONTENT_LENGTH in the env-hash.
             continue;
         }
+        else if (str_case_eq(
+            STR_WITH_LEN("content-type"), hdr->name, hdr->name_len))
+        {
+            hv_stores(e, "CONTENT_TYPE",newSVpvn(hdr->value, hdr->value_len));
+            continue;
+        }
+
+        size_t klen = 5+hdr->name_len;
+        if (kbuflen < klen) {
+            kbuflen = klen;
+            kbuf = Renew(kbuf, kbuflen, char);
+        }
+        char *key = kbuf + 5;
+        for (j=0; j<hdr->name_len; j++) {
+            char n = hdr->name[j];
+            *key++ = (n == '-') ? '_' : toupper(n);
+        }
+
+        SV **val = hv_fetch(e, kbuf, klen, 1);
+        trace("adding header to env (fd %d) %.*s: %.*s\n",
+            c->fd, klen, kbuf, hdr->value_len, hdr->value);
+
+        assert(val != NULL); // "fetch is store" flag should ensure this
+        if (SvPOK(*val)) {
+            trace("... is multivalue\n");
+            // extend header with comma
+            sv_catpvf(*val, ", %.*s", hdr->value_len, hdr->value);
+        }
         else {
-            size_t klen = 5+hdr->name_len;
-            if (kbuflen < klen) {
-                kbuflen = klen;
-                kbuf = Renew(kbuf, kbuflen, char);
-            }
-            char *key = kbuf + 5;
-            for (j=0; j<hdr->name_len; j++) {
-                char n = hdr->name[j];
-                *key++ = (n == '-') ? '_' : toupper(n);
-            }
-
-            SV **val = hv_fetch(e, kbuf, klen, 1);
-            trace("adding header to env (fd %d) %.*s: %.*s\n",
-                c->fd, klen, kbuf, hdr->value_len, hdr->value);
-
-            assert(val != NULL); // "fetch is store" flag should ensure this
-            if (SvPOK(*val)) {
-                trace("... is multivalue\n");
-                // extend header with comma
-                sv_catpvf(*val, ", %.*s", hdr->value_len, hdr->value);
-            }
-            else {
-                // change from undef to a real value
-                sv_setpvn(*val, hdr->value, hdr->value_len);
-            }
+            // change from undef to a real value
+            sv_setpvn(*val, hdr->value, hdr->value_len);
         }
     }
     Safefree(kbuf);
@@ -1564,14 +1573,14 @@ feersum_start_psgi_streaming(pTHX_ struct feer_conn *c, SV *streamer)
 static void
 feersum_handle_psgi_response(pTHX_ struct feer_conn *c, SV *ret)
 {
-    if (IsCodeRef(ret)) {
+    if (!SvOK(ret) || !SvROK(ret)) {
+        sv_setpvs(ERRSV, "Invalid PSGI response (expected defined)");
+        call_died(aTHX_ c, "PSGI request");
+    }
+
+    if (!IsArrayRef(ret)) {
         trace("PSGI response code-ref, c=%p cv=%p\n", c, ret);
         feersum_start_psgi_streaming(aTHX_ c, ret);
-        return;
-    }
-    else if (!IsArrayRef(ret)) {
-        sv_setpvs(ERRSV, "Invalid PSGI response (expected array or code ref)");
-        call_died(aTHX_ c, "PSGI request");
         return;
     }
 
@@ -1843,11 +1852,11 @@ request_handler(SV *self, SV *cb)
         psgi_request_handler = 1
     PPCODE:
 {
-    if (!IsCodeRef(cb))
-        croak("must supply a code reference");
+    if (!SvOK(cb) || !SvROK(cb))
+        croak("can't supply an undef handler");
     if (request_cb_cv)
         SvREFCNT_dec(request_cb_cv);
-    request_cb_cv = SvRV(cb);
+    request_cb_cv = cb;
     SvREFCNT_inc(request_cb_cv);
     request_cb_is_psgi = ix;
     trace("assigned %s request handler %p\n",
