@@ -135,6 +135,7 @@ static void sched_request_callback(struct feer_conn *c);
 static void call_died (pTHX_ struct feer_conn *c, const char *cb_type);
 static void call_request_callback(struct feer_conn *c);
 static void call_poll_callback (struct feer_conn *c, bool is_write);
+static void pump_io_handle (struct feer_conn *c, SV *io);
 
 static void conn_write_ready (struct feer_conn *c);
 static void respond_with_server_error(struct feer_conn *c, const char *msg, STRLEN msg_len, int code);
@@ -174,7 +175,6 @@ static struct rinq *request_ready_rinq = NULL;
 
 static AV *psgi_ver;
 static SV *psgi_serv10, *psgi_serv11, *crlf_sv;
-static SV *pump_io_cv = NULL;
 
 // TODO: make this thread-local if and when there are multiple C threads:
 struct ev_loop *feersum_ev_loop = NULL;
@@ -215,7 +215,10 @@ add_sv_to_wbuf(struct feer_conn *c, SV *sv)
     struct iomatrix *m = next_iomatrix(c);
     int idx = m->count++;
     STRLEN cur;
-    if (SvPADTMP(sv) || SvTEMP(sv)) {
+    if (SvMAGICAL(sv)) {
+        sv = newSVsv(sv); // copy to force it to be normal.
+    }
+    else if (SvPADTMP(sv) || SvTEMP(sv)) {
         // PADTMPs have their PVs re-used, so we can't simply keep a
         // reference.  TEMPs maybe behave in a similar way and are potentially
         // stealable.
@@ -252,6 +255,7 @@ add_sv_to_wbuf(struct feer_conn *c, SV *sv)
     else {
         sv = SvREFCNT_inc(sv);
     }
+
     m->iov[idx].iov_base = SvPV(sv, cur);
     m->iov[idx].iov_len = cur;
     m->sv[idx] = sv;
@@ -594,7 +598,11 @@ try_conn_write(EV_P_ struct ev_io *w, int revents)
             return;
         }
 
-        call_poll_callback(c, 1);
+        if (c->poll_write_cb_is_io_handle)
+            pump_io_handle(c, c->poll_write_cb);
+        else
+            call_poll_callback(c, 1);
+
         // callback didn't write anything:
         if (!c->wbuf_rinq) goto try_write_again;
     }
@@ -1345,7 +1353,7 @@ feersum_start_response (pTHX_ struct feer_conn *c, SV *message, AV *headers,
         STRLEN hlen;
         const char *hp = SvPV(*hdr, hlen);
         if (str_case_eq("content-length",14,hp,hlen)) {
-            trouble("ignoring content-length header in the response");
+            trace("ignoring content-length header in the response\n");
             continue; 
         }
 
@@ -1408,8 +1416,12 @@ feersum_write_whole_body (pTHX_ struct feer_conn *c, SV *body)
         RETVAL = 0;
         for (i=0; i<=amax; i++) {
             SV **elt = av_fetch(abody, i, 0);
-            if (elt == NULL || !SvOK(*elt)) continue;
-            SV *sv = SvROK(*elt) ? SvRV(*elt) : *elt;
+            if (elt == NULL) continue;
+            SV *sv = *elt;
+            // copy to remove magic
+            if (SvMAGICAL(sv)) sv = sv_2mortal(newSVsv(sv));
+            if (!SvOK(sv)) continue;
+            if (SvROK(sv)) sv = SvRV(sv);
             cur = add_sv_to_wbuf(c,sv);
             trace("body part i=%d sv=%p cur=%d\n", i, sv, cur);
             RETVAL += cur;
@@ -1516,8 +1528,8 @@ call_died (pTHX_ struct feer_conn *c, const char *cb_type)
 static void
 call_request_callback (struct feer_conn *c)
 {
-    dSP;
     dTHX;
+    dSP;
     int flags;
     c->in_callback++;
 
@@ -1572,13 +1584,10 @@ call_request_callback (struct feer_conn *c)
 static void
 call_poll_callback (struct feer_conn *c, bool is_write)
 {
-    dSP;
     dTHX;
+    dSP;
     
     SV *cb = (is_write) ? c->poll_write_cb : NULL;
-    SV *io;
-    SV *ret;
-    int flags;
 
     if (!cb) return;
 
@@ -1590,27 +1599,9 @@ call_poll_callback (struct feer_conn *c, bool is_write)
     ENTER;
     SAVETMPS;
     PUSHMARK(SP);
-
-    if (is_write && c->poll_write_cb_is_io_handle) {
-        flags = G_EVAL;
-        // Can't do this in the BOOT section, unfortunately:
-        if (pump_io_cv == NULL) {
-            CV *pump = get_cv("Feersum::Connection::_pump_io", 0);
-            pump_io_cv = newRV_inc((SV*)pump);
-        }
-        cb = pump_io_cv;
-        // it's an RV so copy is light
-        XPUSHs(sv_2mortal(newSVsv(c->poll_write_cb)));
-        ret = newSV(0);
-        XPUSHs(ret);
-    }
-    else {
-        flags = G_DISCARD|G_EVAL|G_VOID;
-        XPUSHs(sv_2mortal(new_feer_conn_handle(c, is_write)));
-    }
-
+    XPUSHs(sv_2mortal(new_feer_conn_handle(c, is_write)));
     PUTBACK;
-    call_sv(cb, flags);
+    call_sv(cb, G_DISCARD|G_EVAL|G_VOID);
     SPAGAIN;
 
     trace("called %s poll callback, errsv? %d\n",
@@ -1619,26 +1610,90 @@ call_poll_callback (struct feer_conn *c, bool is_write)
     if (SvTRUE(ERRSV)) {
         call_died(aTHX_ c, is_write ? "write poll" : "read poll");
     }
-    else if (is_write && c->poll_write_cb_is_io_handle) {
-        if (!SvOK(ret)) {
-            SvREFCNT_dec(c->poll_write_cb);
-            c->poll_write_cb = NULL;
-            finish_wbuf(c);
-            c->responding = RESPOND_SHUTDOWN;
-        }
-        else {
-            if (c->is_http11)
-                add_chunk_sv_to_wbuf(c, ret);
-            else
-                add_sv_to_wbuf(c, ret);
-        }
-        SvREFCNT_dec(ret);
-    }
 
     trace("leaving %s poll callback\n", is_write ? "write" : "read");
     PUTBACK;
     FREETMPS;
     LEAVE;
+
+    c->in_callback--;
+}
+
+static void
+pump_io_handle (struct feer_conn *c, SV *io)
+{
+    dTHX;
+    dSP;
+    SV *ret = NULL;
+
+    if (!io) return;
+
+    c->in_callback++;
+
+    trace("pump io handle %d\n", c->fd);
+
+    ENTER;
+    SAVETMPS;
+
+    // Emulate `local $/ = \4096;`
+    SV *old_rs = PL_rs;
+    PL_rs = sv_2mortal(newRV_noinc(newSViv(4096)));
+    sv_setsv(get_sv("/", GV_ADD), PL_rs);
+
+    PUSHMARK(SP);
+    XPUSHs(c->poll_write_cb);
+    PUTBACK;
+    call_method("getline", G_SCALAR|G_EVAL);
+    SPAGAIN;
+
+    trace("called getline on io handle, errsv? %d %d\n",
+        SvTRUE(ERRSV) ? 1 : 0, c->fd);
+
+    if (SvTRUE(ERRSV)) {
+        call_died(aTHX_ c, "getline on io handle");
+        goto done_pump_io;
+    }
+
+    ret = POPs;
+    if (SvMAGICAL(ret))
+        ret = sv_2mortal(newSVsv(ret));
+
+    if (!SvOK(ret)) {
+        // returned undef, so call the close method out of niceity
+        PUSHMARK(SP);
+        XPUSHs(c->poll_write_cb);
+        PUTBACK;
+        call_method("close", G_VOID|G_DISCARD|G_EVAL);
+        SPAGAIN;
+
+        if (SvTRUE(ERRSV)) {
+            STRLEN len;
+            const char *err = SvPV(ERRSV,len);
+            trouble("Couldn't close body IO handle: %.*s",len,err);
+        }
+
+        SvREFCNT_dec(c->poll_write_cb);
+        c->poll_write_cb = NULL;
+        finish_wbuf(c);
+        c->responding = RESPOND_SHUTDOWN;
+
+        goto done_pump_io;
+    }
+
+    if (c->is_http11)
+        add_chunk_sv_to_wbuf(c, ret);
+    else
+        add_sv_to_wbuf(c, ret);
+
+done_pump_io:
+    trace("leaving pump io handle %d\n", c->fd);
+
+    PUTBACK;
+    FREETMPS;
+    LEAVE;
+
+    PL_rs = old_rs;
+    sv_setsv(get_sv("/", GV_ADD), old_rs);
 
     c->in_callback--;
 }
@@ -1944,34 +1999,23 @@ MODULE = Feersum	PACKAGE = Feersum::Connection
 
 PROTOTYPES: ENABLE
 
-void
-start_response (struct feer_conn *c, SV *message, AV *headers, int streaming)
-    PROTOTYPE: $$\@$
-    PPCODE:
-        feersum_start_response(aTHX_ c, message, headers, streaming);
-
-int
-write_whole_body (struct feer_conn *c, SV *body)
-    PROTOTYPE: $$
+SV *
+start_streaming (struct feer_conn *c, SV *message, AV *headers)
+    PROTOTYPE: $$\@
     CODE:
-        RETVAL = feersum_write_whole_body(aTHX_ c, body);
+        feersum_start_response(aTHX_ c, message, headers, 1);
+        RETVAL = new_feer_conn_handle(c, 1); // RETVAL gets mortalized
     OUTPUT:
         RETVAL
 
-void
-send_response (struct feer_conn *c, SV* msg, SV *hdrs, SV *body)
-    PROTOTYPE: $$$$
-    PPCODE:
-{
-    AV *headers;
-    if (IsArrayRef(hdrs))
-        headers = (AV*)SvRV(hdrs);
-    else
-        croak("Must supply headers as an array-ref");
-
-    feersum_start_response(aTHX_ c, msg, headers, 0);
-    feersum_write_whole_body(aTHX_ c, body);
-}
+int
+send_response (struct feer_conn *c, SV* message, AV *headers, SV *body)
+    PROTOTYPE: $$\@$
+    CODE:
+        feersum_start_response(aTHX_ c, message, headers, 0);
+        RETVAL = feersum_write_whole_body(aTHX_ c, body);
+    OUTPUT:
+        RETVAL
 
 void
 force_http10 (struct feer_conn *c)
@@ -1980,18 +2024,6 @@ force_http10 (struct feer_conn *c)
         force_http11 = 1
     PPCODE:
         c->is_http11 = ix;
-
-SV *
-_handle (struct feer_conn *c)
-    PROTOTYPE: $
-    ALIAS:
-        read_handle = 1
-        write_handle = 2
-    CODE:
-        if(!ix) croak("cannot call _handle directly");
-        RETVAL = new_feer_conn_handle(c, ix-1);
-    OUTPUT:
-        RETVAL
 
 SV *
 env (struct feer_conn *c)
