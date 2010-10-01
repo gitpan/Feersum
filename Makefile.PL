@@ -19,9 +19,10 @@ use EV::MakeMaker qw/ev_args/;
 }
 
 my $otherldflags = '';
-if ($ARGV[0] eq '-DEBUG') {
+if ($ARGV[0] =~ /^-DEBUG=?(\d*)$/) {
+    my $n = $1 || 1;
     shift @ARGV;
-    unshift @ARGV, "OPTIMIZE=-DDEBUG -DDEBUGGING -g";
+    unshift @ARGV, "OPTIMIZE=-DDEBUG=$n -DDEBUGGING -g";
 }
 elsif ($ARGV[0] eq '-PROFILE') {
     shift @ARGV;
@@ -62,7 +63,7 @@ WriteMakefile(ev_args(
     },
     META_MERGE => {
         recommends => {
-            'Plack' => 0.9938,
+            'Plack' => 0.9950,
             'Test::TCP' => 0.16,
         },
         resources => {
@@ -72,6 +73,7 @@ WriteMakefile(ev_args(
         'no_index' => {directory => ['eg','picohttpparser-git']},
     },
     LIBS   => [''],
+    EXE_FILES => ['bin/feersum'],
     DEFINE => ($steal ? '-DFEERSUM_STEAL' : ''),
     INC    => '-I.',
     dynamic_lib => {OTHERLDFLAGS => $otherldflags},

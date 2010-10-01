@@ -1,6 +1,6 @@
 --- #YAML:1.0
 name:               Feersum
-version:            0.94
+version:            0.95
 abstract:           A scary-fast HTTP engine for Perl based on EV/libev
 author:
     - Jeremy Stashewsky <stash@cpan.org>
@@ -31,5 +31,5 @@ meta-spec:
     url:      http://module-build.sourceforge.net/META-spec-v1.4.html
     version:  1.4
 recommends:
-    Plack:      0.9938
+    Plack:      0.995
     Test::TCP:  0.16
