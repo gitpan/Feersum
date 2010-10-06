@@ -1,6 +1,6 @@
 --- #YAML:1.0
 name:               Feersum
-version:            0.96
+version:            0.961
 abstract:           A scary-fast HTTP engine for Perl based on EV/libev
 author:
     - Jeremy Stashewsky <stash@cpan.org>

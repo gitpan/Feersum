@@ -21,25 +21,30 @@ use EV::MakeMaker qw/ev_args/;
 my $otherldflags = '';
 if ($ARGV[0] =~ /^-DEBUG=?(\d*)$/) {
     my $n = $1 || 1;
-    shift @ARGV;
-    unshift @ARGV, "OPTIMIZE=-DDEBUG=$n -DDEBUGGING -g";
+    my $opt = "OPTIMIZE=-DDEBUG=$n -g";
+    # with 5.12.1 and the -DDEBUGGING flag:
+    # dyld: Symbol not found: _Perl_pad_sv
+    $opt .= ($] >= 5.012_001) ? '' : ' -DDEBUGGING';
+    $ARGV[0] = $opt;
 }
 elsif ($ARGV[0] eq '-PROFILE') {
     shift @ARGV;
-    unshift @ARGV, "OPTIMIZE=-g -O3 -fprofile-arcs -ftest-coverage -fprofile-generate";
+    $ARGV[0] = "OPTIMIZE=-g -O3 -fprofile-arcs -ftest-coverage -fprofile-generate";
     $otherldflags = '-lgcov -fprofile-generate';
 }
 elsif ($ARGV[0] eq '-PROFILEUSE') {
-    shift @ARGV;
-    unshift @ARGV, "OPTIMIZE=-g -O3 -fprofile-use";
+    $ARGV[0] = "OPTIMIZE=-g -O3 -fprofile-use";
     $otherldflags = '-fprofile-use';
 }
 
 # Set this to false if you get core-dumps. Gives a pretty good perf boost for
 # simple responses. Look for FEERSUM_STEAL in the code to see what this does.
 # In a nutshell: certain temporary values passed in as the body of a response
-# have their string-value "stolen".
-my $steal = ($] >= 5.012);
+# have their string-value "stolen".  This very much doesn't work under threaded
+# perl (5.8.7 and 5.12.1 were tested) and probably doesn't work prior to
+# 5.12.0.
+use Config;
+my $steal = ($] >= 5.012 && !defined($Config{useithreads}));
 
 WriteMakefile(ev_args(
     NAME          => 'Feersum',
