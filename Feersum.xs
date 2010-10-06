@@ -23,7 +23,14 @@
 #define MAX_HEADERS 64
 #define MAX_HEADER_NAME_LEN 128
 #define MAX_BODY_LENGTH 2147483647
-#define READ_CHUNK 4096
+
+// Read buffers start out at READ_INIT_FACTOR * READ_BUFSZ bytes.
+// If another read is needed and the buffer is under READ_BUFSZ bytes
+// then the buffer gets an additional READ_GROW_FACTOR * READ_BUFSZ bytes.
+// The trade-off with the grow factor is memory usage vs. system calls.
+#define READ_BUFSZ 4096
+#define READ_INIT_FACTOR 2
+#define READ_GROW_FACTOR 8
 
 // Setting this to true will wait for writability before calling write() (will
 // try to immediately write otherwise)
@@ -110,9 +117,10 @@ struct feer_conn {
     U16 in_callback;
     U16 responding;
     U16 receiving;
-    U16 _reservedflags:14;
+    U16 _reservedflags:13;
     U16 is_http11:1;
     U16 poll_write_cb_is_io_handle:1;
+    U16 auto_cl:1;
 };
 
 typedef struct feer_conn feer_conn_handle; // for typemap
@@ -149,6 +157,7 @@ static void respond_with_server_error(struct feer_conn *c, const char *msg, STRL
 
 static STRLEN add_sv_to_wbuf (struct feer_conn *c, SV *sv);
 static STRLEN add_const_to_wbuf (struct feer_conn *c, const char const *str, size_t str_len);
+#define add_crlf_to_wbuf(c) add_const_to_wbuf(c,CRLF,2)
 static void finish_wbuf (struct feer_conn *c);
 static void add_chunk_sv_to_wbuf (struct feer_conn *c, SV *sv);
 static void add_placeholder_to_wbuf (struct feer_conn *c, SV **sv, struct iovec **iov_ref);
@@ -225,12 +234,13 @@ add_sv_to_wbuf(struct feer_conn *c, SV *sv)
     if (SvMAGICAL(sv)) {
         sv = newSVsv(sv); // copy to force it to be normal.
     }
-    else if (SvPADTMP(sv) || SvTEMP(sv)) {
+    else if (SvPADTMP(sv)) {
         // PADTMPs have their PVs re-used, so we can't simply keep a
         // reference.  TEMPs maybe behave in a similar way and are potentially
         // stealable.
 #ifdef FEERSUM_STEAL
         if (SvFLAGS(sv) == SVs_PADTMP|SVf_POK|SVp_POK) {
+            trace3("STEALING\n");
             // XXX: EGREGIOUS HACK THAT MAKES THINGS A LOT FASTER
             // steal the PV from a PADTMP PV
             SV *theif = newSV(0);
@@ -251,7 +261,7 @@ add_sv_to_wbuf(struct feer_conn *c, SV *sv)
             sv = theif;
         }
         else {
-            // be safe an just make a simple copy
+            // be safe and just make a copy
             sv = newSVsv(sv);
         }
 #else
@@ -289,6 +299,7 @@ add_placeholder_to_wbuf(struct feer_conn *c, SV **sv, struct iovec **iov_ref)
     struct iomatrix *m = next_iomatrix(c);
     int idx = m->count++;
     *sv = newSV(31);
+    SvPOK_on(*sv);
     m->sv[idx] = *sv;
     *iov_ref = &m->iov[idx];
 }
@@ -309,7 +320,7 @@ add_chunk_sv_to_wbuf(struct feer_conn *c, SV *sv)
     struct iovec *chunk_iov;
     add_placeholder_to_wbuf(c, &chunk, &chunk_iov);
     STRLEN cur = add_sv_to_wbuf(c, sv);
-    add_const_to_wbuf(c, CRLF, 2);
+    add_crlf_to_wbuf(c);
     sv_setpvf(chunk, "%x" CRLF, cur);
     update_wbuf_placeholder(c, chunk, chunk_iov);
 }
@@ -809,17 +820,20 @@ try_conn_read(EV_P_ ev_io *w, int revents)
 
     if (!c->rbuf) {
         trace("init rbuf for %d\n",w->fd);
-        c->rbuf = newSV(2*READ_CHUNK + 1);
+        c->rbuf = newSV(READ_INIT_FACTOR*READ_BUFSZ + 1);
+        SvPOK_on(c->rbuf);
     }
 
-    if (SvLEN(c->rbuf) - SvCUR(c->rbuf) < READ_CHUNK) {
-        size_t new_len = SvLEN(c->rbuf) + READ_CHUNK;
+    ssize_t space_free = SvLEN(c->rbuf) - SvCUR(c->rbuf);
+    if (space_free < READ_BUFSZ) {
+        size_t new_len = SvLEN(c->rbuf) + READ_GROW_FACTOR*READ_BUFSZ;
         trace("moar memory %d: %d to %d\n",w->fd, SvLEN(c->rbuf),new_len);
         SvGROW(c->rbuf, new_len);
+        space_free += READ_GROW_FACTOR*READ_BUFSZ;
     }
 
     char *cur = SvPVX(c->rbuf) + SvCUR(c->rbuf);
-    ssize_t got_n = read(w->fd, cur, READ_CHUNK);
+    ssize_t got_n = read(w->fd, cur, space_free);
 
     if (got_n == -1) {
         if (errno == EAGAIN || errno == EINTR)
@@ -1025,11 +1039,19 @@ process_request_headers (struct feer_conn *c, int body_offset)
     
     // a body potentially follows the headers. Let feer_req retain its
     // pointers into rbuf and make a new scalar for more body data.
-    int need = SvCUR(c->rbuf) - body_offset;
-    char *from  = SvPVX(c->rbuf) + body_offset;
-    SV *new_rbuf = newSV((need > 2*READ_CHUNK) ? need-1 : 2*READ_CHUNK-1);
+    STRLEN from_len;
+    char *from = SvPV(c->rbuf,from_len);
+    from += body_offset;
+    int need = from_len - body_offset;
+    int new_alloc = (need > READ_INIT_FACTOR*READ_BUFSZ)
+        ? need : READ_INIT_FACTOR*READ_BUFSZ-1;
+    trace("new rbuf for body %d need=%d alloc=%d\n",c->fd, need, new_alloc);
+    SV *new_rbuf = newSV(new_alloc);
     if (need)
         sv_setpvn(new_rbuf, from, need);
+    else
+        SvPOK_on(new_rbuf);
+
     req->buf = c->rbuf;
     c->rbuf = new_rbuf;
 
@@ -1080,6 +1102,7 @@ got_cl:
     c->expected_cl = (ssize_t)expected;
     c->received_cl = SvCUR(c->rbuf);
     trace("expecting body %d size=%d have=%d\n",c->fd, c->expected_cl,c->received_cl);
+    SvGROW(c->rbuf, c->expected_cl + 1);
 
     // don't have enough bytes to schedule immediately?
     if (c->expected_cl && c->received_cl < c->expected_cl) {
@@ -1434,21 +1457,38 @@ feersum_start_response (pTHX_ struct feer_conn *c, SV *message, AV *headers,
     }
 
     I32 avl = av_len(headers);
-    if (avl < 0 || (avl % 2 != 1)) {
-        croak("expected even-length array");
+    if (avl+1 % 2 == 1) {
+        croak("expected even-length array, got %d", avl+1);
     }
 
     // int or 3 chars? use a stock message
-    if (SvIOK(message) || (SvPOK(message) && SvCUR(message) == 3)) {
-        int code = SvIV(message);
+    UV code = 0;
+    if (SvIOK(message))
+        code = SvIV(message);
+    else if (SvUOK(message))
+        code = SvUV(message);
+    else {
+        const int numtype = grok_number(SvPVX_const(message),3,&code);
+        if (numtype != IS_NUMBER_IN_UV)
+            code = 0;
+    }
+    trace2("starting response fd=%d code=%u\n",c->fd,code);
+
+    if (!code)
+        croak("first parameter is not a number or doesn't start with digits");
+
+    if (!SvPOK(message) || SvCUR(message) == 3) {
         ptr = http_code_to_msg(code);
         len = strlen(ptr);
         message = sv_2mortal(newSVpvf("%d %.*s",code,len,ptr));
     }
+    
+    // don't generate or strip Content-Length headers for 304 responses.
+    c->auto_cl = (code == 304) ? 0 : 1;
 
     add_const_to_wbuf(c, c->is_http11 ? "HTTP/1.1 " : "HTTP/1.0 ", 9);
     add_sv_to_wbuf(c, message);
-    add_const_to_wbuf(c, CRLF, 2);
+    add_crlf_to_wbuf(c);
 
     for (i=0; i<avl; i+= 2) {
         SV **hdr = av_fetch(headers, i, 0);
@@ -1465,7 +1505,7 @@ feersum_start_response (pTHX_ struct feer_conn *c, SV *message, AV *headers,
 
         STRLEN hlen;
         const char *hp = SvPV(*hdr, hlen);
-        if (str_case_eq("content-length",14,hp,hlen)) {
+        if (c->auto_cl && str_case_eq("content-length",14,hp,hlen)) {
             trace("ignoring content-length header in the response\n");
             continue; 
         }
@@ -1473,7 +1513,7 @@ feersum_start_response (pTHX_ struct feer_conn *c, SV *message, AV *headers,
         add_sv_to_wbuf(c, *hdr);
         add_const_to_wbuf(c, ": ", 2);
         add_sv_to_wbuf(c, *val);
-        add_const_to_wbuf(c, CRLF, 2);
+        add_crlf_to_wbuf(c);
     }
 
     if (streaming) {
@@ -1517,7 +1557,10 @@ feersum_write_whole_body (pTHX_ struct feer_conn *c, SV *body)
 
     SV *cl_sv; // content-length future
     struct iovec *cl_iov;
-    add_placeholder_to_wbuf(c, &cl_sv, &cl_iov);
+    if (c->auto_cl)
+        add_placeholder_to_wbuf(c, &cl_sv, &cl_iov);
+    else
+        add_crlf_to_wbuf(c);
 
     if (body_is_string) {
         cur = add_sv_to_wbuf(c,body);
@@ -1541,8 +1584,10 @@ feersum_write_whole_body (pTHX_ struct feer_conn *c, SV *body)
         }
     }
 
-    sv_setpvf(cl_sv, "Content-Length: %d" CRLFx2, RETVAL);
-    update_wbuf_placeholder(c, cl_sv, cl_iov);
+    if (c->auto_cl) {
+        sv_setpvf(cl_sv, "Content-Length: %d" CRLFx2, RETVAL);
+        update_wbuf_placeholder(c, cl_sv, cl_iov);
+    }
 
     c->responding = RESPOND_SHUTDOWN;
     conn_write_ready(c);
@@ -1576,6 +1621,7 @@ feersum_handle_psgi_response(pTHX_ struct feer_conn *c, SV *ret)
     if (!SvOK(ret) || !SvROK(ret)) {
         sv_setpvs(ERRSV, "Invalid PSGI response (expected defined)");
         call_died(aTHX_ c, "PSGI request");
+        return;
     }
 
     if (!IsArrayRef(ret)) {
@@ -1618,6 +1664,7 @@ feersum_handle_psgi_response(pTHX_ struct feer_conn *c, SV *ret)
     else {
         sv_setpvs(ERRSV, "Expected PSGI array-ref or IO::Handle-like body");
         call_died(aTHX_ c, "PSGI request");
+        return;
     }
 }
 
@@ -1663,18 +1710,19 @@ call_request_callback (struct feer_conn *c)
     }
 
     PUTBACK;
-    call_sv(request_cb_cv, flags);
+    int returned = call_sv(request_cb_cv, flags);
     SPAGAIN;
 
     trace("called request callback, errsv? %d\n", SvTRUE(ERRSV) ? 1 : 0);
 
     if (SvTRUE(ERRSV)) {
         call_died(aTHX_ c, "request");
+        returned = 0; // pretend nothing got returned
     }
 
     SV *psgi_response;
-    if (request_cb_is_psgi) {
-        psgi_response = *sp;
+    if (request_cb_is_psgi && returned >= 1) {
+        psgi_response = POPs;
         SvREFCNT_inc(psgi_response);
     }
 
@@ -1683,7 +1731,7 @@ call_request_callback (struct feer_conn *c)
     FREETMPS;
     LEAVE;
 
-    if (request_cb_is_psgi) {
+    if (request_cb_is_psgi && returned >= 1) {
         feersum_handle_psgi_response(aTHX_ c, psgi_response);
         SvREFCNT_dec(psgi_response);
     }
@@ -1753,22 +1801,23 @@ pump_io_handle (struct feer_conn *c, SV *io)
     PUSHMARK(SP);
     XPUSHs(c->poll_write_cb);
     PUTBACK;
-    call_method("getline", G_SCALAR|G_EVAL);
+    int returned = call_method("getline", G_SCALAR|G_EVAL);
     SPAGAIN;
 
-    trace("called getline on io handle, errsv? %d %d\n",
-        SvTRUE(ERRSV) ? 1 : 0, c->fd);
+    trace("called getline on io handle fd=%d errsv=%d returned=%d\n",
+        c->fd, SvTRUE(ERRSV) ? 1 : 0, returned);
 
     if (SvTRUE(ERRSV)) {
         call_died(aTHX_ c, "getline on io handle");
         goto done_pump_io;
     }
 
-    ret = POPs;
-    if (SvMAGICAL(ret))
+    if (returned > 0)
+        ret = POPs;
+    if (ret && SvMAGICAL(ret))
         ret = sv_2mortal(newSVsv(ret));
 
-    if (!SvOK(ret)) {
+    if (!ret || !SvOK(ret)) {
         // returned undef, so call the close method out of niceity
         PUSHMARK(SP);
         XPUSHs(c->poll_write_cb);
@@ -1941,46 +1990,61 @@ read (feer_conn_handle *hdl, SV *buf, size_t len, ...)
     PROTOTYPE: $$$;$
     PPCODE:
 {
-    STRLEN buf_len, src_len;
+    STRLEN buf_len = 0, src_len = 0;
+    ssize_t offset;
     char *buf_ptr, *src_ptr;
-    bool src_ookd;
     
-    //  if (items > 3 && SvOK(ST(3)) && SvIOK(ST(3)))
-    //      off = SvUV(ST(3));
-    if (items > 3)
-        croak("reading with an offset is not yet supported");
+    if (items == 4 && SvOK(ST(3)) && SvIOK(ST(3)))
+        offset = SvIV(ST(3));
+    else
+        offset = 0;
+
+    trace("read fd=%d : request    len=%d off=%d\n", c->fd, len, offset);
 
     if (c->receiving <= RECEIVE_HEADERS)
         croak("can't call read() until the body begins to arrive");
 
     if (!SvOK(buf) || !SvPOK(buf)) {
-        SvUPGRADE(buf, SVt_PV);
+        // force to a PV and ensure buffer space
+        sv_setpvn(buf,"",0);
+        SvGROW(buf, len+1);
     }
 
     if (SvREADONLY(buf))
         croak("buffer must not be read-only");
 
-    buf_ptr = SvPV(buf, buf_len);
-    if (c->rbuf) {
-        trace("getting rbuf src_ptr\n");
-        src_ptr = SvPV(c->rbuf, src_len);
-    }
+    if (len == 0)
+        XSRETURN_IV(0); // assumes undef buffer got allocated to empty-string
 
-    if (!c->rbuf || src_len == 0) {
-        trace("rbuf empty during read %d\n", c->fd);
+    buf_ptr = SvPV(buf, buf_len);
+    if (c->rbuf)
+        src_ptr = SvPV(c->rbuf, src_len);
+
+    if (len < 0)
+        len = src_len;
+
+    if (offset < 0)
+        offset = (-offset >= c->received_cl) ? 0 : c->received_cl + offset;
+
+    if (len + offset > src_len) 
+        len = src_len - offset;
+
+    trace("read fd=%d : normalized len=%d off=%d src_len=%d\n",
+        c->fd, len, offset, src_len);
+
+    if (!c->rbuf || src_len == 0 || offset >= c->received_cl) {
+        trace2("rbuf empty during read %d\n", c->fd);
         if (c->receiving == RECEIVE_SHUTDOWN) {
-            XSRETURN_IV(0); // all done
+            XSRETURN_IV(0);
         }
         else {
-            errno = EAGAIN; // need to wait for more
+            errno = EAGAIN;
             XSRETURN_UNDEF;
         }
     }
 
-    if (len == -1) len = src_len;
-
-    if (len >= src_len) {
-        trace("appending entire rbuf %d\n", c->fd);
+    if (len == src_len && offset == 0) {
+        trace2("appending entire rbuf fd=%d\n", c->fd);
         sv_2mortal(c->rbuf); // allow pv to be stolen
         if (buf_len == 0) {
             sv_setsv(buf, c->rbuf);
@@ -1989,18 +2053,20 @@ read (feer_conn_handle *hdl, SV *buf, size_t len, ...)
             sv_catsv(buf, c->rbuf);
         }
         c->rbuf = NULL;
-        XSRETURN_IV(src_len);
     }
     else {
-        trace("appending partial rbuf %d len=%d ptr=%p\n", c->fd, len, SvPVX(c->rbuf));
-        // partial append
+        src_ptr += offset;
+        trace2("appending partial rbuf fd=%d len=%d off=%d ptr=%p\n",
+            c->fd, len, offset, src_ptr);
         SvGROW(buf, SvCUR(buf) + len);
         sv_catpvn(buf, src_ptr, len);
-        sv_chop(c->rbuf, SvPVX(c->rbuf) + len);
-        XSRETURN_IV(len);
+        if (items == 3) {
+            // there wasn't an offset param, throw away beginning
+            sv_chop(c->rbuf, SvPVX(c->rbuf) + len);
+        }
     }
 
-    XSRETURN_UNDEF;
+    XSRETURN_IV(len);
 }
 
 STRLEN
@@ -2037,7 +2103,57 @@ write (feer_conn_handle *hdl, SV *body, ...)
         RETVAL
 
 int
-_close (feer_conn_handle *hdl)
+seek (feer_conn_handle *hdl, ssize_t offset, ...)
+    PROTOTYPE: $$;$
+    CODE:
+{
+    int whence = SEEK_CUR;
+    if (items == 3 && SvOK(ST(2)) && SvIOK(ST(2)))
+        whence = SvIV(ST(2));
+
+    trace("seek fd=%d offset=%d whence=%d\n", c->fd, offset, whence);
+
+    if (!c->rbuf) {
+        // handle is effectively "closed"
+        RETVAL = 0;
+    }
+    else if (offset == 0) {
+        RETVAL = 1; // stay put for any whence
+    }
+    else if (offset > 0 && (whence == SEEK_CUR || whence == SEEK_SET)) {
+        STRLEN len;
+        const char *str = SvPV_const(c->rbuf, len);
+        if (offset > len)
+            offset = len;
+        sv_chop(c->rbuf, str + offset);
+        RETVAL = 1;
+    }
+    else if (offset < 0 && whence == SEEK_END) {
+        STRLEN len;
+        const char *str = SvPV_const(c->rbuf, len);
+        offset += len; // can't be > len since block is offset<0
+        if (offset == 0) {
+            RETVAL = 1; // no-op, but OK
+        }
+        else if (offset > 0) {
+            sv_chop(c->rbuf, str + offset);
+            RETVAL = 1;
+        }
+        else {
+            // past beginning of string
+            RETVAL = 0;
+        }
+    }
+    else {
+        // invalid seek
+        RETVAL = 0;
+    }
+}
+    OUTPUT:
+        RETVAL
+
+int
+close (feer_conn_handle *hdl)
     PROTOTYPE: $
     ALIAS:
         Feersum::Connection::Reader::close = 1
@@ -2048,6 +2164,10 @@ _close (feer_conn_handle *hdl)
     case 1:
         trace("close reader fd=%d, c=%p\n", c->fd, c);
         // TODO: ref-dec poll_read_cb
+        if (c->rbuf) {
+            SvREFCNT_dec(c->rbuf);
+            c->rbuf = NULL;
+        }
         RETVAL = shutdown(c->fd, SHUT_RD); // TODO: respect keep-alive
         c->receiving = RECEIVE_SHUTDOWN;
         break;
