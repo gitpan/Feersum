@@ -5,12 +5,16 @@ use warnings;
 use EV ();
 use Carp ();
 
-our $VERSION = '0.971';
+our $VERSION = '0.981';
 
 require Feersum::Connection;
 require Feersum::Connection::Handle;
 require XSLoader;
 XSLoader::load('Feersum', $VERSION);
+
+# numify as per
+# http://www.dagolden.com/index.php/369/version-numbers-should-be-boring/
+$VERSION = eval $VERSION;
 
 our $INSTANCE;
 
@@ -35,14 +39,14 @@ sub use_socket {
 
 # overload this to catch Feersum errors and exceptions thrown by request
 # callbacks.
-sub DIED { warn "DIED: $@"; }
+sub DIED { Carp::confess "DIED: $@"; }
 
 1;
 __END__
 
 =head1 NAME
 
-Feersum - A scary-fast HTTP engine for Perl based on EV/libev
+Feersum - A PSGI engine for Perl based on EV/libev
 
 =head1 SYNOPSIS
 
@@ -156,6 +160,8 @@ dynamic ones:
     psgix.input.buffered   => 1,
     psgix.output.buffered  => 1,
     psgix.body.scalar_refs => 1,
+    # warning: read notes below on this extension:
+    psgix.io => \$magical_io_socket,
 
 Note that SCRIPT_NAME is always blank (but defined).  PATH_INFO will contain
 the path part of the requested URI.
@@ -178,30 +184,43 @@ it will be immediately flushed to the socket.
     my $app = sub {
         my $env = shift;
         return sub {
-            my $starter = shift;
-            my $w = $starter->([
+            my $respond = shift;
+            my $w = $respond->([
                 200, ['Content-Type' => 'application/json']
             ]);
             my $n = 0;
             $w->poll_cb(sub {
                 $_[0]->write(get_next_chunk());
+                # will also unset the poll_cb:
                 $_[0]->close if ($n++ >= 100);
             });
         };
     };
 
-=head3 PSGI extensions
+Note that C<< $w->close() >> will be called when the last reference to the
+writer is dropped.
+
+=head2 PSGI extensions
+
+=over 4
+
+=item psgix.body.scalar_refs
 
 Scalar refs in the response body are supported, and is indicated as an via the
-C<psgix.body.scalar_refs> env variable. Passing by reference is
+B<psgix.body.scalar_refs> env variable. Passing by reference is
 B<significantly> faster than copying a value onto the return stack or into an
 array.  It's also very useful when broadcasting a message to many connected
-clients.
+clients.  This is a Feersum-native feature exposed to PSGI apps; very few
+other PSGI handlers will support this.
+
+=item psgix.output.buffered
 
 Calls to C<< $w->write() >> will never block.  This behaviour is indicated by
-C<psgix.output.buffered> in the PSGI env hash.  
+B<psgix.output.buffered> in the PSGI env hash.
 
-C<psgix.input.buffered> is also set, which means that calls to read on the
+=item psgix.input.buffered
+
+B<psgix.input.buffered> is also set, which means that calls to read on the
 input handle will also never block.  Feersum currently buffers the entire
 input before calling the callback.
 
@@ -212,6 +231,27 @@ C<EAGAIN>).  Feersum may also allow for registering a poll_cb() handler that
 works similarly to the method on the "writer" object, although that isn't
 currently part of the PSGI 1.03 spec.  The callback will be called once data
 has been buffered.
+
+=item psgix.io
+
+The raw socket extension B<psgix.io> is provided in order to support
+L<Web::Hippie> and websockets.  To obtain the L<IO::Socket> corresponding to
+this connection, read this environment variable.
+
+The underlying file descriptor will have C<O_NONBLOCK>, C<TCP_NODELAY>,
+C<SO_OOBINLINE> enabled and C<SO_LINGER> disabled.
+
+PSGI apps B<MUST> use a C<psgi.streaming> response so that Feersum doesn't try
+to flush and close the connection.  Additionally, the "respond" parameter to
+the streaming callback B<MUST NOT> be called for the same reason.
+
+    my $env = shift;
+    return sub {
+        my $fh = $env->{'psgix.io'};
+        syswrite $fh, 
+    };
+
+=back
 
 =head2 The Feersum-native interface
 
@@ -286,6 +326,9 @@ stop the callback from getting called.
         $_[0]->write(get_next_chunk());
         $_[0]->close if ($n++ >= 100);
     });
+
+Note that C<< $w->close() >> will be called when the last reference to the
+writer is dropped.
 
 =head1 METHODS
 
@@ -379,10 +422,13 @@ propagated.
 
 =cut
 
-
 =head1 LIMITS
 
 =over 4
+
+=item HTTP methods
+
+Only GET POST PUT DELETE HEAD - others are not supported.
 
 =item listening sockets
 
@@ -417,11 +463,6 @@ This could lead to a DoS attack on a Feersum server.  Suggested remedy is to
 only run Feersum behind some other web server and to use that to limit the
 entity size.
 
-Something isn't getting set right with the TCP socket options and the last
-chunk in a streamed response is sometimes lost.  This happens more frequently
-under high concurrency.  Fiddling with TCP_NODELAY and SO_LINGER don't seem to
-help.  Maybe threads are needed to do blocking close() and shutdown() calls?
-
 =head1 SEE ALSO
 
 http://en.wikipedia.org/wiki/Feersum_Endjinn
@@ -444,11 +485,12 @@ Marc Lehmann for EV and AnyEvent (not to mention JSON::XS and Coro).
 
 Kazuho Oku for picohttpparser.
 
-lukec, konobi, socialtexters and van.pm for initial feedback and ideas.
+Luke Closs (lukec), Scott McWhirter (konobi), socialtexters and van.pm for
+initial feedback and ideas.  Audrey Tang and Graham Termarsch for XS advice.
 
-Audrey Tang and Graham Termarsch for XS advice.
+Hans Dieter Pearcey (confound) for docs and packaging guidance.
 
-confound for docs input.
+For bug reports: Chia-liang Kao (clkao), Lee Aylward (leedo)
 
 =head1 COPYRIGHT AND LICENSE
 

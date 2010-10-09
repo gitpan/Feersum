@@ -133,7 +133,9 @@ static HV* feersum_env(pTHX_ struct feer_conn *c);
 static void feersum_start_response
     (pTHX_ struct feer_conn *c, SV *message, AV *headers, int streaming);
 static int feersum_write_whole_body (pTHX_ struct feer_conn *c, SV *body);
-static void feersum_handle_psgi_response(pTHX_ struct feer_conn *c, SV *ret);
+static void feersum_handle_psgi_response(
+    pTHX_ struct feer_conn *c, SV *ret, bool can_recurse);
+static int feersum_close_handle(pTHX_ struct feer_conn *c, bool is_writer);
 
 static void start_read_watcher(struct feer_conn *c);
 static void stop_read_watcher(struct feer_conn *c);
@@ -171,6 +173,7 @@ static int prep_socket (int fd);
 
 static HV *feer_stash, *feer_conn_stash;
 static HV *feer_conn_reader_stash = NULL, *feer_conn_writer_stash = NULL;
+static MGVTBL psgix_io_vtbl;
 
 static SV *request_cb_cv = NULL;
 static bool request_cb_is_psgi = 0;
@@ -528,7 +531,7 @@ sv_2feer_conn_handle (SV *rv, bool can_croak)
 }
 
 static SV *
-new_feer_conn_handle (struct feer_conn *c, bool is_writer)
+new_feer_conn_handle (pTHX_ struct feer_conn *c, bool is_writer)
 {
     SV *sv;
     SvREFCNT_inc(c->self);
@@ -773,7 +776,6 @@ try_write_shutdown:
     c->responding = RESPOND_SHUTDOWN;
     stop_write_watcher(c);
     make_blocking(c->fd);
-    //shutdown(c->fd, SHUT_WR);
     if(close(c->fd))
         perror("close socket at shutdown");
     c->fd = 0;
@@ -878,7 +880,6 @@ try_read_error:
     stop_read_watcher(c);
     stop_read_timer(c);
     stop_write_watcher(c);
-    //shutdown(c->fd, SHUT_RDWR);
     if (close(c->fd))
         perror("close on read error");
     c->fd = 0;
@@ -894,7 +895,6 @@ dont_read_again:
     c->receiving = RECEIVE_SHUTDOWN;
     stop_read_watcher(c);
     stop_read_timer(c);
-    shutdown(c->fd, SHUT_RD);
     goto try_read_cleanup;
 
 try_read_again_reset_timer:
@@ -926,7 +926,6 @@ conn_read_timeout (EV_P_ ev_timer *w, int revents)
     trace("read timeout %d\n", c->fd);
 
     if (c->responding == RESPOND_NOT_STARTED) {
-        shutdown(c->fd, SHUT_RD);
         const char *msg;
         if (c->receiving == RECEIVE_HEADERS) {
             msg = "Headers took too long.";
@@ -942,7 +941,6 @@ conn_read_timeout (EV_P_ ev_timer *w, int revents)
         stop_read_watcher(c);
         stop_read_timer(c);
         make_blocking(c->fd);
-        //shutdown(c->fd, SHUT_RDWR);
         if(close(c->fd))
             perror("close socket at read timeout");
         c->fd = 0;
@@ -1010,6 +1008,7 @@ process_request_headers (struct feer_conn *c, int body_offset)
 
     trace("processing headers %d minor_version=%d\n",c->fd,req->minor_version);
     bool body_is_required;
+    bool next_req_follows = 0;
 
     c->is_http11 = (req->minor_version == 1);
 
@@ -1019,11 +1018,11 @@ process_request_headers (struct feer_conn *c, int body_offset)
         str_eq("HEAD", 4, req->method, req->method_len) ||
         str_eq("DELETE", 6, req->method, req->method_len))
     {
-        // Not supposed to have a body.  Additional bytes are either a mistake
-        // or pipelined requests under HTTP/1.1
-
-        // XXX ignore them for now
-        goto got_it_all;
+        // Not supposed to have a body.  Additional bytes are either a
+        // mistake, a websocket negotiation or pipelined requests under
+        // HTTP/1.1
+        next_req_follows = 1;
+        trace("next req follows fd=%d, boff=%d\n",c->fd,body_offset);
     }
     else if (str_eq("PUT", 3, req->method, req->method_len) ||
              str_eq("POST", 4, req->method, req->method_len))
@@ -1037,8 +1036,8 @@ process_request_headers (struct feer_conn *c, int body_offset)
         goto got_bad_request;
     }
     
-    // a body potentially follows the headers. Let feer_req retain its
-    // pointers into rbuf and make a new scalar for more body data.
+    // a body or follow-on data potentially follows the headers. Let feer_req
+    // retain its pointers into rbuf and make a new scalar for more body data.
     STRLEN from_len;
     char *from = SvPV(c->rbuf,from_len);
     from += body_offset;
@@ -1046,14 +1045,14 @@ process_request_headers (struct feer_conn *c, int body_offset)
     int new_alloc = (need > READ_INIT_FACTOR*READ_BUFSZ)
         ? need : READ_INIT_FACTOR*READ_BUFSZ-1;
     trace("new rbuf for body %d need=%d alloc=%d\n",c->fd, need, new_alloc);
-    SV *new_rbuf = newSV(new_alloc);
-    if (need)
-        sv_setpvn(new_rbuf, from, need);
-    else
-        SvPOK_on(new_rbuf);
+    SV *new_rbuf = newSVpvn(need ? from : "", need);
 
     req->buf = c->rbuf;
     c->rbuf = new_rbuf;
+    SvCUR_set(req->buf, body_offset);
+
+    if (next_req_follows)
+        goto got_it_all;
 
     // determine how much we need to read
     int i;
@@ -1162,7 +1161,6 @@ respond_with_server_error (struct feer_conn *c, const char *msg, STRLEN msg_len,
 
     stop_read_watcher(c);
     stop_read_timer(c);
-    shutdown(c->fd, SHUT_RD);
     c->responding = RESPOND_SHUTDOWN;
     c->receiving = RECEIVE_SHUTDOWN;
     conn_write_ready(c);
@@ -1294,6 +1292,8 @@ feersum_init_tmpl_env(pTHX)
     hv_stores(e, "HTTP_IF_MODIFIED_SINCE", &PL_sv_placeholder);
     hv_stores(e, "HTTP_IF_NONE_MATCH", &PL_sv_placeholder);
     hv_stores(e, "HTTP_CACHE_CONTROL", &PL_sv_placeholder);
+
+    hv_stores(e, "psgix.io", &PL_sv_placeholder);
     
     feersum_tmpl_env = e;
 }
@@ -1351,10 +1351,17 @@ feersum_env(pTHX_ struct feer_conn *c)
 
     if (c->expected_cl > 0) {
         hv_stores(e, "CONTENT_LENGTH", newSViv(c->expected_cl));
-        hv_stores(e, "psgi.input", new_feer_conn_handle(c,0));
+        hv_stores(e, "psgi.input", new_feer_conn_handle(aTHX_ c,0));
     }
     else if (request_cb_is_psgi) {
         // TODO: make psgi.input a valid, but always empty stream for PSGI mode?
+    }
+
+    if (request_cb_is_psgi) {
+        SV *fake_fh = newSViv(c->fd); // just some random dummy value
+        SV *selfref = sv_2mortal(feer_conn_2sv(c));
+        sv_magicext(fake_fh, selfref, PERL_MAGIC_ext, &psgix_io_vtbl, NULL, 0);
+        hv_stores(e, "psgix.io", fake_fh);
     }
 
     {
@@ -1483,8 +1490,8 @@ feersum_start_response (pTHX_ struct feer_conn *c, SV *message, AV *headers,
         message = sv_2mortal(newSVpvf("%d %.*s",code,len,ptr));
     }
     
-    // don't generate or strip Content-Length headers for 304 responses.
-    c->auto_cl = (code == 304) ? 0 : 1;
+    // don't generate or strip Content-Length headers for 304 or 1xx
+    c->auto_cl = (code == 304 || (100 <= code && code <= 199)) ? 0 : 1;
 
     add_const_to_wbuf(c, c->is_http11 ? "HTTP/1.1 " : "HTTP/1.0 ", 9);
     add_sv_to_wbuf(c, message);
@@ -1601,8 +1608,7 @@ feersum_start_psgi_streaming(pTHX_ struct feer_conn *c, SV *streamer)
     ENTER;
     SAVETMPS;
     PUSHMARK(SP);
-    SV *conn_sv = sv_2mortal(feer_conn_2sv(c));
-    XPUSHs(conn_sv);
+    mXPUSHs(feer_conn_2sv(c));
     XPUSHs(streamer);
     PUTBACK;
     call_method("_initiate_streaming_psgi", G_DISCARD|G_EVAL|G_VOID);
@@ -1616,17 +1622,24 @@ feersum_start_psgi_streaming(pTHX_ struct feer_conn *c, SV *streamer)
 }
 
 static void
-feersum_handle_psgi_response(pTHX_ struct feer_conn *c, SV *ret)
+feersum_handle_psgi_response(
+    pTHX_ struct feer_conn *c, SV *ret, bool can_recurse)
 {
     if (!SvOK(ret) || !SvROK(ret)) {
-        sv_setpvs(ERRSV, "Invalid PSGI response (expected defined)");
+        sv_setpvs(ERRSV, "Invalid PSGI response (expected reference)");
         call_died(aTHX_ c, "PSGI request");
         return;
     }
 
-    if (!IsArrayRef(ret)) {
-        trace("PSGI response code-ref, c=%p cv=%p\n", c, ret);
-        feersum_start_psgi_streaming(aTHX_ c, ret);
+    if (SvOK(ret) && !IsArrayRef(ret)) {
+        if (can_recurse) {
+            trace("PSGI response non-array, c=%p ret=%p\n", c, ret);
+            feersum_start_psgi_streaming(aTHX_ c, ret);
+        }
+        else {
+            sv_setpvs(ERRSV, "PSGI attempt to recurse in a streaming callback");
+            call_died(aTHX_ c, "PSGI request");
+        }
         return;
     }
 
@@ -1638,9 +1651,9 @@ feersum_handle_psgi_response(pTHX_ struct feer_conn *c, SV *ret)
     }
 
     trace("PSGI response triplet, c=%p av=%p\n", c, psgi_triplet);
-    SV *msg = av_shift(psgi_triplet);
-    SV *hdrs = av_shift(psgi_triplet);
-    SV *body = av_shift(psgi_triplet);
+    SV *msg =  *(av_fetch(psgi_triplet,0,0));
+    SV *hdrs = *(av_fetch(psgi_triplet,1,0));
+    SV *body = *(av_fetch(psgi_triplet,2,0));
 
     AV *headers;
     if (IsArrayRef(hdrs))
@@ -1668,15 +1681,50 @@ feersum_handle_psgi_response(pTHX_ struct feer_conn *c, SV *ret)
     }
 }
 
+static int
+feersum_close_handle (pTHX_ struct feer_conn *c, bool is_writer)
+{
+    int RETVAL;
+    if (is_writer) {
+        trace("close writer fd=%d, c=%p, refcnt=%d\n", c->fd, c, SvREFCNT(c->self));
+        if (c->poll_write_cb) {
+            SvREFCNT_dec(c->poll_write_cb);
+            c->poll_write_cb = NULL;
+        }
+        if (c->responding < RESPOND_SHUTDOWN) {
+            finish_wbuf(c);
+            conn_write_ready(c);
+            c->responding = RESPOND_SHUTDOWN;
+        }
+        RETVAL = 1;
+    }
+    else {
+        trace("close reader fd=%d, c=%p\n", c->fd, c);
+        // TODO: ref-dec poll_read_cb
+        if (c->rbuf) {
+            SvREFCNT_dec(c->rbuf);
+            c->rbuf = NULL;
+        }
+        RETVAL = shutdown(c->fd, SHUT_RD);
+        c->receiving = RECEIVE_SHUTDOWN;
+    }
+
+    // disassociate the handle from the conn
+    SvREFCNT_dec(c->self);
+    return RETVAL;
+}
+
 static void
 call_died (pTHX_ struct feer_conn *c, const char *cb_type)
 {
     dSP;
+#if DEBUG >= 1
     STRLEN err_len;
     char *err = SvPV(ERRSV,err_len);
     trace("An error was thrown in the %s callback: %.*s\n",cb_type,err_len,err);
+#endif
     PUSHMARK(SP);
-    XPUSHs(sv_2mortal(newSVsv(ERRSV)));
+    mXPUSHs(newSVsv(ERRSV));
     PUTBACK;
     call_pv("Feersum::DIED", G_DISCARD|G_EVAL|G_VOID|G_KEEPERR);
     SPAGAIN;
@@ -1692,6 +1740,7 @@ call_request_callback (struct feer_conn *c)
     dSP;
     int flags;
     c->in_callback++;
+    SvREFCNT_inc(c->self);
 
     trace("request callback c=%p\n", c);
 
@@ -1701,11 +1750,11 @@ call_request_callback (struct feer_conn *c)
 
     if (request_cb_is_psgi) {
         HV *env = feersum_env(aTHX_ c);
-        XPUSHs(sv_2mortal(newRV_noinc((SV*)env)));
+        mXPUSHs(newRV_noinc((SV*)env));
         flags = G_EVAL|G_SCALAR;
     }
     else {
-        XPUSHs(sv_2mortal(feer_conn_2sv(c)));
+        mXPUSHs(feer_conn_2sv(c));
         flags = G_DISCARD|G_EVAL|G_VOID;
     }
 
@@ -1732,11 +1781,12 @@ call_request_callback (struct feer_conn *c)
     LEAVE;
 
     if (request_cb_is_psgi && returned >= 1) {
-        feersum_handle_psgi_response(aTHX_ c, psgi_response);
+        feersum_handle_psgi_response(aTHX_ c, psgi_response, 1); // can_recurse
         SvREFCNT_dec(psgi_response);
     }
 
     c->in_callback--;
+    SvREFCNT_dec(c->self);
 }
 
 static void
@@ -1757,7 +1807,7 @@ call_poll_callback (struct feer_conn *c, bool is_write)
     ENTER;
     SAVETMPS;
     PUSHMARK(SP);
-    XPUSHs(sv_2mortal(new_feer_conn_handle(c, is_write)));
+    mXPUSHs(new_feer_conn_handle(aTHX_ c, is_write));
     PUTBACK;
     call_sv(cb, G_DISCARD|G_EVAL|G_VOID);
     SPAGAIN;
@@ -1857,6 +1907,57 @@ done_pump_io:
     c->in_callback--;
 }
 
+static int
+psgix_io_svt_get (pTHX_ SV *sv, MAGIC *mg)
+{
+    dSP;
+
+    struct feer_conn *c = sv_2feer_conn(mg->mg_obj);
+    sv_unmagic(sv, PERL_MAGIC_ext);
+
+    ENTER;
+    SAVETMPS;
+
+    trace("invoking psgix.io magic for fd=%d\n", c->fd);
+
+    PUSHMARK(SP);
+    XPUSHs(sv);
+    mXPUSHs(newSViv(c->fd));
+    PUTBACK;
+
+    call_pv("Feersum::Connection::_raw", G_VOID|G_DISCARD|G_EVAL);
+    SPAGAIN;
+
+    if (SvTRUE(ERRSV)) {
+        call_died(aTHX_ c, "psgix.io magic");
+    }
+    else {
+        SV *io_glob   = SvRV(sv);
+        GvSV(io_glob) = newRV_inc(c->self);
+
+        // put whatever remainder data into the socket buffer.  For keepalive
+        // support the opposite operation is required; pull the data out of
+        // the socket buffer and back into feersum.
+        if (c->rbuf && SvOK(c->rbuf) && SvCUR(c->rbuf)) {
+            STRLEN rbuf_len;
+            const char *rbuf_ptr = SvPV(c->rbuf, rbuf_len);
+            IO *io = GvIOp(io_glob);
+            assert(io != NULL);
+            PerlIO_unread(IoIFP(io), (const void *)rbuf_ptr, rbuf_len);
+            sv_setpvs(c->rbuf, "");
+        }
+
+        stop_read_watcher(c);
+        stop_read_timer(c);
+        // don't stop write watcher in case there's outstanding data.
+    }
+
+    PUTBACK;
+    FREETMPS;
+    LEAVE;
+    return 0;
+}
+
 MODULE = Feersum		PACKAGE = Feersum		
 
 PROTOTYPES: ENABLE
@@ -1905,7 +2006,7 @@ request_handler(SV *self, SV *cb)
         croak("can't supply an undef handler");
     if (request_cb_cv)
         SvREFCNT_dec(request_cb_cv);
-    request_cb_cv = newRV_inc(SvRV(cb));
+    request_cb_cv = newSVsv(cb); // copy so 5.8.7 overload magic sticks.
     request_cb_is_psgi = ix;
     trace("assigned %s request handler %p\n",
         request_cb_is_psgi?"PSGI":"Feersum", request_cb_cv);
@@ -1971,16 +2072,23 @@ fileno (feer_conn_handle *hdl)
 
 void
 DESTROY (SV *self)
+    ALIAS:
+        Feersum::Connection::Reader::DESTROY = 1
+        Feersum::Connection::Writer::DESTROY = 2
     PPCODE:
 {
     feer_conn_handle *hdl = sv_2feer_conn_handle(self, 0);
+
     if (hdl == NULL) {
-        trace3("DESTROY handle (closed) class=%s\n", HvNAME(SvSTASH(SvRV(ST(0)))));
+        trace3("DESTROY handle (closed) class=%s\n",
+            HvNAME(SvSTASH(SvRV(self))));
     }
     else {
         struct feer_conn *c = (struct feer_conn *)hdl;
-        trace3("DESTROY handle fd=%d, class=%s\n", c->fd, HvNAME(SvSTASH(SvRV(ST(0)))));
-        SvREFCNT_dec(c->self);
+        trace3("DESTROY handle fd=%d, class=%s\n", c->fd,
+            HvNAME(SvSTASH(SvRV(self))));
+        if (ix == 2) // only close the writer on destruction
+            feersum_close_handle(aTHX_ c, 1);
     }
 }
 
@@ -2069,15 +2177,16 @@ read (feer_conn_handle *hdl, SV *buf, size_t len, ...)
 }
 
 STRLEN
-write (feer_conn_handle *hdl, SV *body, ...)
+write (feer_conn_handle *hdl, ...)
+    PROTOTYPE: $;$
     CODE:
 {
     if (c->responding != RESPOND_STREAMING)
         croak("can only call write in streaming mode");
 
-    if (!body || !SvOK(body)) {
+    SV *body = (items == 2) ? ST(1) : &PL_sv_undef;
+    if (!body || !SvOK(body))
         XSRETURN_IV(0);
-    }
 
     trace("write fd=%d c=%p, body=%p\n", c->fd, c, body);
     if (SvROK(body)) {
@@ -2159,35 +2268,9 @@ close (feer_conn_handle *hdl)
         Feersum::Connection::Writer::close = 2
     CODE:
 {
-    switch (ix) {
-    case 1:
-        trace("close reader fd=%d, c=%p\n", c->fd, c);
-        // TODO: ref-dec poll_read_cb
-        if (c->rbuf) {
-            SvREFCNT_dec(c->rbuf);
-            c->rbuf = NULL;
-        }
-        RETVAL = shutdown(c->fd, SHUT_RD); // TODO: respect keep-alive
-        c->receiving = RECEIVE_SHUTDOWN;
-        break;
-    case 2:
-        trace("close writer fd=%d, c=%p, refcnt=%d\n", c->fd, c, SvREFCNT(c->self));
-        if (c->poll_write_cb) {
-            SvREFCNT_dec(c->poll_write_cb);
-            c->poll_write_cb = NULL;
-        }
-        finish_wbuf(c);
-        conn_write_ready(c);
-        c->responding = RESPOND_SHUTDOWN;
-        RETVAL = 1;
-        break;
-    default:
-        croak("cannot call _close directly");
-    }
-
-    // disassociate the handle from the conn
+    assert(ix);
+    RETVAL = feersum_close_handle(aTHX_ c, (ix == 2));
     SvUVX(hdl_sv) = 0;
-    SvREFCNT_dec(c->self);
 }
     OUTPUT:
         RETVAL
@@ -2230,7 +2313,7 @@ start_streaming (struct feer_conn *c, SV *message, AV *headers)
     PROTOTYPE: $$\@
     CODE:
         feersum_start_response(aTHX_ c, message, headers, 1);
-        RETVAL = new_feer_conn_handle(c, 1); // RETVAL gets mortalized
+        RETVAL = new_feer_conn_handle(aTHX_ c, 1); // RETVAL gets mortalized
     OUTPUT:
         RETVAL
 
@@ -2240,6 +2323,39 @@ send_response (struct feer_conn *c, SV* message, AV *headers, SV *body)
     CODE:
         feersum_start_response(aTHX_ c, message, headers, 0);
         RETVAL = feersum_write_whole_body(aTHX_ c, body);
+    OUTPUT:
+        RETVAL
+
+SV*
+_continue_streaming_psgi (struct feer_conn *c, SV *psgi_response)
+    PROTOTYPE: $\@
+    CODE:
+{
+    AV *av;
+    int len = 0;
+
+    if (IsArrayRef(psgi_response)) {
+        av = (AV*)SvRV(psgi_response);
+        len = av_len(av) + 1;
+    }
+
+    if (len == 3) {
+        // 0 is "don't recurse" (i.e. don't allow another code-ref)
+        feersum_handle_psgi_response(aTHX_ c, psgi_response, 0);
+        RETVAL = &PL_sv_undef;
+    }
+    else if (len == 2) {
+        SV *message = *(av_fetch(av,0,0));
+        SV *headers = *(av_fetch(av,1,0));
+        if (!IsArrayRef(headers))
+            croak("PSGI headers must be an array ref");
+        feersum_start_response(aTHX_ c, message, (AV*)SvRV(headers), 1);
+        RETVAL = new_feer_conn_handle(aTHX_ c, 1); // RETVAL gets mortalized
+    }
+    else {
+        croak("PSGI response starter expects a 2 or 3 element array-ref");
+    }
+}
     OUTPUT:
         RETVAL
 
@@ -2271,7 +2387,7 @@ DESTROY (struct feer_conn *c)
     PPCODE:
 {
     int i;
-    trace3("DESTROY conn %d %p\n", c->fd, c);
+    trace3("DESTROY conn fd=%d c=%p\n", c->fd, c);
 
     if (c->rbuf) SvREFCNT_dec(c->rbuf);
 
@@ -2341,4 +2457,7 @@ BOOT:
         SvREADONLY_on(psgi_serv10);
         psgi_serv11 = newSVpvs("HTTP/1.1");
         SvREADONLY_on(psgi_serv11);
+
+        Zero(&psgix_io_vtbl, 1, MGVTBL);
+        psgix_io_vtbl.svt_get = psgix_io_svt_get;
     }

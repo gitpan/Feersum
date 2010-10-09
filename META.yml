@@ -1,7 +1,7 @@
 --- #YAML:1.0
 name:               Feersum
-version:            0.971
-abstract:           A scary-fast HTTP engine for Perl based on EV/libev
+version:            0.981
+abstract:           A PSGI engine for Perl based on EV/libev
 author:
     - Jeremy Stashewsky <stash@cpan.org>
 license:            perl
@@ -12,6 +12,7 @@ configure_requires:
 build_requires:
     AnyEvent:         5.261
     Guard:            1.012
+    JSON::XS:         2
     Scalar::Util:     1.19
     Test::Exception:  0.29
     Test::More:       0.94

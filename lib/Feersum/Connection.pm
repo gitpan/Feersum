@@ -1,6 +1,7 @@
 package Feersum::Connection;
 use strict;
 use Carp qw/croak/;
+use IO::Socket::INET;
 
 sub new {
     croak "Cannot instantiate Feersum::Connection directly";
@@ -27,27 +28,28 @@ sub initiate_streaming {
 
 sub _initiate_streaming_psgi {
     my ($self, $streamer) = @_;
-    @_ = (sub {
-        my $strm = shift;
-        if ($#$strm == 2) {
-            $self->send_response($strm->[0],$strm->[1],$strm->[2]);
-        }
-        elsif ($#$strm == 1) {
-            return $self->start_streaming($strm->[0],$strm->[1]);
-        }
-        else {
-            croak "PSGI streaming starter expects an array";
-        }
-        return;
-    });
-
-    if (ref($streamer) eq 'CODE') {
-        goto &$streamer;
-    }
-    # Maybe it's callable but not a CODE-ref:
-    $streamer->(@_);
+    $streamer->(sub { $self->_continue_streaming_psgi(@_) });
 }
 
+sub _raw {
+    # don't shift; want to modify $_[0] directly.
+    my $fileno = $_[1];
+    # Hack to make gensyms via new_from_fd() show up in the Feersum package.
+    # This may or may not save memory (HEKs?) over true gensyms.
+    no warnings 'redefine';
+    local *IO::Handle::gensym = sub {
+        no strict;
+        my $pkg = "Feersum::";
+        my $name = "RAW$fileno";
+        my $gv = \*{$pkg.$name};
+        delete $$pkg{$name};
+        $gv;
+    };
+    $_[0] = IO::Socket::INET->new_from_fd($fileno, '+<');
+    # after this, Feersum will use PerlIO_unread to put any remainder data
+    # into the socket.
+    return;
+}
 1;
 __END__
 
