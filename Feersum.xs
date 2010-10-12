@@ -19,6 +19,11 @@
 #endif
 #define CRLFx2 CRLF CRLF
 
+// make darwin, solaris and bsd happy:
+#ifndef SOL_TCP
+ #define SOL_TCP IPPROTO_TCP
+#endif
+
 // if you change these, also edit the LIMITS section in the POD
 #define MAX_HEADERS 64
 #define MAX_HEADER_NAME_LEN 128
@@ -50,7 +55,7 @@
 #define trouble(f_, ...) warn(WARN_PREFIX f_, ##__VA_ARGS__);
 
 #ifdef DEBUG
-#define trace(f_, ...) warn("%s:%d: " f_, __FILE__, __LINE__, ##__VA_ARGS__)
+#define trace(f_, ...) warn("%s:%d [%d] " f_, __FILE__, __LINE__, (int)getpid(), ##__VA_ARGS__)
 #else
 #define trace(...)
 #endif
@@ -421,11 +426,7 @@ prep_socket(int fd)
 
     // flush writes immediately
     flags = 1;
-#if PERL_DARWIN
-    if (setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &flags, sizeof(int)))
-#else
     if (setsockopt(fd, SOL_TCP, TCP_NODELAY, &flags, sizeof(int)))
-#endif
         return -1;
 
     // handle URG data inline
@@ -477,12 +478,17 @@ new_feer_conn (EV_P_ int conn_fd, struct sockaddr *sa)
     trace3("made conn fd=%d self=%p, c=%p, cur=%d, len=%d\n",
         c->fd, self, c, SvCUR(self), SvLEN(self));
 
+    SV *rv = newRV_inc(c->self);
+    sv_bless(rv, feer_conn_stash); // so DESTROY can get called on read errors
+    SvREFCNT_dec(rv);
+
     SvREADONLY_on(self); // turn off later for blessing
     active_conns++;
     return c;
 }
 
 // for use in the typemap:
+INLINE_UNLESS_DEBUG
 static struct feer_conn *
 sv_2feer_conn (SV *rv)
 {
@@ -491,18 +497,11 @@ sv_2feer_conn (SV *rv)
     return (struct feer_conn *)SvPVX(SvRV(rv));
 }
 
+INLINE_UNLESS_DEBUG
 static SV*
 feer_conn_2sv (struct feer_conn *c)
 {
-    SV *rv = newRV_inc(c->self);
-    if (!SvOBJECT(c->self)) {
-        trace3("c->self not yet an object\n");
-        SvREADONLY_off(c->self);
-        // XXX: should this block use newRV_noinc instead?
-        sv_bless(rv, feer_conn_stash);
-        SvREADONLY_on(c->self);
-    }
-    return rv;
+    return newRV_inc(c->self);
 }
 
 static feer_conn_handle *
@@ -880,9 +879,6 @@ try_read_error:
     stop_read_watcher(c);
     stop_read_timer(c);
     stop_write_watcher(c);
-    if (close(c->fd))
-        perror("close on read error");
-    c->fd = 0;
     goto try_read_cleanup;
 
 try_read_bad:
@@ -977,7 +973,7 @@ accept_cb (EV_P_ ev_io *w, int revents)
         socklen_t sl = sizeof(struct sockaddr_storage);
         errno = 0;
         int fd = accept(w->fd, (struct sockaddr *)sa, &sl);
-        trace3("accepted fd=%d, errno=%d\n", fd, errno);
+        trace("accepted fd=%d, errno=%d\n", fd, errno);
         if (fd == -1) break;
 
         struct feer_conn *c = new_feer_conn(EV_A,fd,(struct sockaddr *)sa);
@@ -1996,6 +1992,17 @@ accept_on_fd(SV *self, int fd)
 }
 
 void
+unlisten (SV *self)
+    PPCODE:
+{
+    trace("stopping accept\n");
+    ev_prepare_stop(feersum_ev_loop, &ep);
+    ev_check_stop(feersum_ev_loop, &ec);
+    ev_idle_stop(feersum_ev_loop, &ei);
+    ev_io_stop(feersum_ev_loop, &accept_w);
+}
+
+void
 request_handler(SV *self, SV *cb)
     PROTOTYPE: $&
     ALIAS:
@@ -2021,13 +2028,26 @@ graceful_shutdown (SV *self, SV *cb)
         croak("must supply a code reference");
     if (shutting_down)
         croak("already shutting down");
-    shutdown_cb_cv = SvRV(cb);
-    SvREFCNT_inc(shutdown_cb_cv);
-    trace("assigned shutdown handler %p\n", SvRV(cb));
+    shutdown_cb_cv = newSVsv(cb);
+    trace("shutting down, handler=%p, active=%d\n", SvRV(cb), active_conns);
 
     shutting_down = 1;
     ev_io_stop(feersum_ev_loop, &accept_w);
     close(accept_w.fd);
+
+    if (active_conns <= 0) {
+        dSP;
+        ENTER;
+        SAVETMPS;
+        PUSHMARK(SP);
+        call_sv(shutdown_cb_cv, G_EVAL|G_VOID|G_DISCARD|G_NOARGS|G_KEEPERR);
+        PUTBACK;
+        trace3("called shutdown handler\n");
+        SvREFCNT_dec(shutdown_cb_cv);
+        shutdown_cb_cv = NULL;
+        FREETMPS;
+        LEAVE;
+    }
 }
 
 double

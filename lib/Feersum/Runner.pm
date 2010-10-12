@@ -3,8 +3,11 @@ use strict;
 
 use EV;
 use Feersum;
+use Socket qw/SOMAXCONN/;
+use POSIX ();
+use Scalar::Util qw/weaken/;
 
-sub new { my $c = shift; bless {@_},$c }
+sub new { my $c = shift; bless {quiet => 1, @_},$c }
 
 sub _prepare {
     my $self = shift;
@@ -23,7 +26,7 @@ sub _prepare {
             LocalAddr => $listen,
             ReuseAddr => 1,
             Proto => 'tcp',
-            Listen => 1024,
+            Listen => SOMAXCONN,
             Blocking => 0,
         );
         die "couldn't bind to socket: $!" unless $sock;
@@ -32,17 +35,98 @@ sub _prepare {
     my $f = Feersum->endjinn;
     $f->use_socket($sock);
 
+    if ($self->{options}) {
+        # Plack::Runner puts these here
+        $self->{pre_fork} = delete $self->{options}{pre_fork};
+    }
+
     $self->{endjinn} = $f;
+}
+
+# for overriding:
+sub assign_request_handler {
+    $_[0]->{endjinn}->request_handler($_[1]);
 }
 
 sub run {
     my $self = shift;
+    weaken $self;
+
+    $self->{quiet} or warn "Feersum [$$]: starting...\n";
     $self->_prepare();
-    my $rh = shift || delete $self->{app};
-    die "not a code ref" unless ref($rh) eq 'CODE';
-    $self->{endjinn}->request_handler($rh);
+
+    my $rh = shift || delete $self->{app} || do $self->{app_file};
+    $self->assign_request_handler($rh);
     undef $rh;
+
+    $self->{_quit} = EV::signal 'QUIT', sub { $self->quit };
+
+    $self->pre_fork if $self->{pre_fork};
     EV::loop;
+    $self->{quiet} or warn "Feersum [$$]: done\n";
+}
+
+sub fork_another {
+    my ($self, $slot) = @_;
+    weaken $self;
+
+    my $pid = fork;
+    die "failed to fork: $!" unless defined $pid;
+    unless ($pid) {
+        EV::default_loop()->loop_fork;
+        $self->{quiet} or warn "Feersum [$$]: starting\n";
+        delete $self->{_kids};
+        delete $self->{pre_fork};
+        eval { EV::loop; };
+        warn $@ if $@;
+        POSIX::exit($@ ? -1 : 0);
+    }
+
+    $self->{_n_kids}++;
+    $self->{_kids}[$slot] = EV::child $pid, 0, sub {
+        my $w = shift;
+        $self->{quiet} or warn "Feersum [$$]: child $pid exited ".
+            "with rstatus ".$w->rstatus."\n";
+        $self->{_n_kids}--;
+        if ($self->{_shutdown}) {
+            EV::unloop(EV::UNLOOP_ALL) unless $self->{_n_kids};
+            return;
+        }
+        $self->fork_another();
+    };
+}
+
+sub pre_fork {
+    my $self = shift;
+
+    POSIX::setsid();
+
+    $self->{_kids} = [];
+    $self->{_n_kids} = 0;
+    $self->fork_another($_) for (1 .. $self->{pre_fork});
+
+    $self->{endjinn}->unlisten();
+}
+
+sub quit {
+    my $self = shift;
+    return if $self->{_shutdown};
+
+    $self->{_shutdown} = 1;
+    $self->{quiet} or warn "Feersum [$$]: shutting down...\n";
+    my $death = 5;
+
+    if ($self->{_n_kids}) {
+        # in parent, broadcast SIGQUIT to the group
+        kill 3, -$$; # kill process group, but not self
+        $death += 2;
+    }
+    else {
+        # in child or solo process
+        $self->{endjinn}->graceful_shutdown(sub { POSIX::exit(0) });
+    }
+
+    $self->{_death} = EV::timer $death, 0, sub { POSIX::exit(1) };
 }
 
 1;
@@ -56,14 +140,43 @@ Feersum::Runner
 
     use Feersum::Runner;
     my $runner = Feersum::Runner->new(
-        listen => 'localhost:12345',
+        listen => 'localhost:5000',
+        pre_fork => 0,
+        quiet => 1,
+        app_file => 'app.feersum',
     );
     $runner->run($feersum_app);
 
 =head1 DESCRIPTION
 
-Much like L<Plack::Runner>, but with far fewer options (only a single 'listen'
-or 'host'/'port' pair is currently supported).
+Much like L<Plack::Runner>, but with far fewer options.
+
+=head1 ATTRIBUTES
+
+The following initialization options are available.
+
+=over 4
+
+=item listen
+
+Listen on this TCP socket (C<host:port> format).
+
+=item pre_fork
+
+Fork this many worker processes.
+
+The fork is run immediately at startup and after the app is loaded (i.e. in
+the C<run()> method).
+
+=item quiet
+
+Don't be so noisy.
+
+=item app_file
+
+Load this filename as a native feersum app.
+
+=back
 
 =head1 METHODS
 
