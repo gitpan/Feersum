@@ -114,6 +114,7 @@ struct feer_conn {
     struct rinq *wbuf_rinq;
 
     SV *poll_write_cb;
+    SV *ext_guard;
 
     struct feer_req *req;
     ssize_t expected_cl;
@@ -141,6 +142,7 @@ static int feersum_write_whole_body (pTHX_ struct feer_conn *c, SV *body);
 static void feersum_handle_psgi_response(
     pTHX_ struct feer_conn *c, SV *ret, bool can_recurse);
 static int feersum_close_handle(pTHX_ struct feer_conn *c, bool is_writer);
+static SV* feersum_conn_guard(pTHX_ struct feer_conn *c, SV *guard);
 
 static void start_read_watcher(struct feer_conn *c);
 static void stop_read_watcher(struct feer_conn *c);
@@ -1257,6 +1259,7 @@ feersum_init_tmpl_env(pTHX)
     hv_stores(e, "psgix.input.buffered", &PL_sv_yes);
     hv_stores(e, "psgix.output.buffered", &PL_sv_yes);
     hv_stores(e, "psgix.body.scalar_refs", &PL_sv_yes);
+    hv_stores(e, "psgix.output.guard", &PL_sv_yes);
     hv_stores(e, "SCRIPT_NAME", newSVpvs(""));
 
     // placeholders that get defined for every request
@@ -1710,6 +1713,16 @@ feersum_close_handle (pTHX_ struct feer_conn *c, bool is_writer)
     return RETVAL;
 }
 
+static SV*
+feersum_conn_guard(pTHX_ struct feer_conn *c, SV *guard)
+{
+    if (guard) {
+        if (c->ext_guard) SvREFCNT_dec(c->ext_guard);
+        c->ext_guard = SvOK(guard) ? newSVsv(guard) : NULL;
+    }
+    return c->ext_guard ? newSVsv(c->ext_guard) : &PL_sv_undef;
+}
+
 static void
 call_died (pTHX_ struct feer_conn *c, const char *cb_type)
 {
@@ -2036,6 +2049,7 @@ graceful_shutdown (SV *self, SV *cb)
     close(accept_w.fd);
 
     if (active_conns <= 0) {
+        trace("shutdown is immediate\n");
         dSP;
         ENTER;
         SAVETMPS;
@@ -2324,6 +2338,14 @@ _poll_cb (feer_conn_handle *hdl, SV *cb)
     conn_write_ready(c);
 }
 
+SV*
+response_guard (feer_conn_handle *hdl, ...)
+    PROTOTYPE: $;$
+    CODE:
+        RETVAL = feersum_conn_guard(aTHX_ c, (items==2) ? ST(1) : NULL);
+    OUTPUT:
+        RETVAL
+
 MODULE = Feersum	PACKAGE = Feersum::Connection
 
 PROTOTYPES: ENABLE
@@ -2402,12 +2424,20 @@ fileno (struct feer_conn *c)
     OUTPUT:
         RETVAL
 
+SV*
+response_guard (struct feer_conn *c, ...)
+    PROTOTYPE: $;$
+    CODE:
+        RETVAL = feersum_conn_guard(aTHX_ c, (items == 2) ? ST(1) : NULL);
+    OUTPUT:
+        RETVAL
+
 void
 DESTROY (struct feer_conn *c)
     PPCODE:
 {
     int i;
-    trace3("DESTROY conn fd=%d c=%p\n", c->fd, c);
+    trace("DESTROY connection fd=%d c=%p\n", c->fd, c);
 
     if (c->rbuf) SvREFCNT_dec(c->rbuf);
 
@@ -2435,6 +2465,8 @@ DESTROY (struct feer_conn *c)
     }
 
     if (c->poll_write_cb) SvREFCNT_dec(c->poll_write_cb);
+
+    if (c->ext_guard) SvREFCNT_dec(c->ext_guard);
 
     active_conns--;
 

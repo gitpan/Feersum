@@ -3,8 +3,6 @@ CPAN!
 
 Test and handle fork() gracefully. (v1.0)
 
-Per-client data (for attaching guards) (v1.0)
-
 Timeouts
     * slow responses? (feasable? just let TCP do it?)
 
@@ -32,13 +30,6 @@ Handle requests that don't require a body (optional entities).
     * Related: allow overriding the "if entity has a C-L, wait for it" during request
     start (not sure if there's a PSGI-compatible way to do this)
     * different request timeout logic will be needed.
-
-Per-client "drain" and "completion" callbacks?
-
-    * drain sorta done as the $w->poll_cb()
-    * completion_cb is called when finished sending a full HTTP response.  For
-    non-KA a guard on the conn object is sufficient, but for KA a callback is
-    needed.
 
 Optimize env-hash
 
