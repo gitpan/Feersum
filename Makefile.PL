@@ -29,8 +29,8 @@ if ($ARGV[0] =~ /^-DEBUG=?(\d*)$/) {
 }
 elsif ($ARGV[0] eq '-PROFILE') {
     shift @ARGV;
-    $ARGV[0] = "OPTIMIZE=-g -O3 -fprofile-arcs -ftest-coverage -fprofile-generate";
-    $otherldflags = '-lgcov -fprofile-generate';
+    $ARGV[0] = "OPTIMIZE=-g -fprofile-arcs -ftest-coverage";
+    $otherldflags = '-lgcov';
 }
 elsif ($ARGV[0] eq '-PROFILEUSE') {
     $ARGV[0] = "OPTIMIZE=-g -O3 -fprofile-use";
@@ -53,7 +53,7 @@ WriteMakefile(ev_args(
     AUTHOR        => 'Jeremy Stashewsky <stash@cpan.org>',
     LICENSE       => 'perl',
     CONFIGURE_REQUIRES => {
-        'EV' => 3.9,
+        'EV' => 4.00,
         'ExtUtils::MakeMaker' => 6.51,
     },
     BUILD_REQUIRES => {
@@ -65,7 +65,7 @@ WriteMakefile(ev_args(
         'JSON::XS' => 2.0,
     },
     PREREQ_PM => {
-        'EV' => 3.9,
+        'EV' => 4.00,
     },
     META_MERGE => {
         recommends => {

@@ -1,13 +1,13 @@
 --- #YAML:1.0
 name:               Feersum
-version:            0.984
+version:            0.985
 abstract:           A PSGI engine for Perl based on EV/libev
 author:
     - Jeremy Stashewsky <stash@cpan.org>
 license:            perl
 distribution_type:  module
 configure_requires:
-    EV:                   3.9
+    EV:                   4
     ExtUtils::MakeMaker:  6.51
 build_requires:
     AnyEvent:         5.261
@@ -17,7 +17,7 @@ build_requires:
     Test::Exception:  0.29
     Test::More:       0.94
 requires:
-    EV:  3.9
+    EV:  4
 resources:
     license:     http://dev.perl.org/licenses/
     repository:  git://github.com/stash/Feersum.git
