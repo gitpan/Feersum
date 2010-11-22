@@ -1,7 +1,7 @@
 #!perl
 use warnings;
 use strict;
-use Test::More tests => 139;
+use Test::More tests => 143;
 use Test::Exception;
 use utf8;
 use lib 't'; use Utils;
@@ -33,8 +33,9 @@ $evh->request_handler(sub {
     my $tn = $env->{HTTP_X_TEST_NUM} || 0;
     ok $tn, "got a test number header $tn";
 
-    is_deeply $env->{'psgi.version'}, [1,0], 'got psgi.version';
+    is_deeply $env->{'psgi.version'}, [1,1], 'got psgi.version';
     is $env->{'psgi.url_scheme'}, "http", 'got psgi.url_scheme';
+    ok exists $env->{'psgi.run_once'}, 'got psgi.run_once';
     ok $env->{'psgi.nonblocking'}, 'got psgi.nonblocking';
     is $env->{'psgi.multithread'}, '', 'got psgi.multithread';
     is $env->{'psgi.multiprocess'}, '', 'got psgi.multiprocess';
