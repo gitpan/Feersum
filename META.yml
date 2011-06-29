@@ -1,6 +1,6 @@
 --- #YAML:1.0
 name:               Feersum
-version:            1.200
+version:            1.201
 abstract:           A PSGI engine for Perl based on EV/libev
 author:
     - Jeremy Stashewsky <stash@cpan.org>
@@ -14,7 +14,6 @@ build_requires:
     Guard:        1.012
     Test::Fatal:  0.003
     Test::More:   0.94
-    Test::TCP:    1.12
 requires:
     EV:            4
     Scalar::Util:  1.19
@@ -32,5 +31,7 @@ meta-spec:
     url:      http://module-build.sourceforge.net/META-spec-v1.4.html
     version:  1.4
 recommends:
-    JSON::XS:  2
-    Plack:     0.995
+    JSON::XS:         2
+    Plack:            0.995
+    Test::LeakTrace:  0.13
+    Test::TCP:        1.12
