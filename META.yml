@@ -1,6 +1,6 @@
 --- #YAML:1.0
 name:               Feersum
-version:            1.201
+version:            1.202
 abstract:           A PSGI engine for Perl based on EV/libev
 author:
     - Jeremy Stashewsky <stash@cpan.org>
