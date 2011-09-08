@@ -1,4 +1,5 @@
 package Feersum::Runner;
+use warnings;
 use strict;
 
 use EV;
@@ -6,19 +7,45 @@ use Feersum;
 use Socket qw/SOMAXCONN/;
 use POSIX ();
 use Scalar::Util qw/weaken/;
+use Carp qw/carp croak/;
 
-sub new { my $c = shift; bless {quiet => 1, @_},$c }
+use constant DEATH_TIMER => 5.0; # seconds
+use constant DEATH_TIMER_INCR => 2.0; # seconds
+use constant DEFAULT_HOST => 'localhost';
+use constant DEFAULT_PORT => 5000;
+
+our $INSTANCE;
+sub new { ## no critic (RequireArgUnpacking)
+    my $c = shift;
+    croak "Only one Feersum::Runner instance can be active at a time"
+        if $INSTANCE && $INSTANCE->{running};
+    $INSTANCE = bless {quiet=>1, @_, running=>0}, $c;
+    return $INSTANCE;
+}
+
+sub DESTROY {
+    local $@;
+    my $self = shift;
+    if (my $f = $self->{endjinn}) {
+        $f->request_handler(sub{});
+        $f->unlisten();
+    }
+    $self->{_quit} = undef;
+    return;
+}
 
 sub _prepare {
     my $self = shift;
 
-    my @listen = @{$self->{listen} || [ ($self->{host} || '') . ":$self->{port}" ]};
-    die "multiple listen directives not yet supported" if @listen > 1;
-    my $listen = shift @listen;
+    $self->{listen} ||=
+        [ ($self->{host}||DEFAULT_HOST).':'.($self->{port}||DEFAULT_PORT) ];
+    croak "Feersum doesn't support multiple 'listen' directives yet"
+        if @{$self->{listen}} > 1;
+    my $listen = shift @{$self->{listen}};
 
     my $sock;
     if ($listen =~ m#^unix/#) {
-        die "listening on a unix socket isn't supported yet";
+        croak "listening on a unix socket isn't supported yet";
     }
     else {
         require IO::Socket::INET;
@@ -29,7 +56,7 @@ sub _prepare {
             Listen => SOMAXCONN,
             Blocking => 0,
         );
-        die "couldn't bind to socket: $!" unless $sock;
+        croak "couldn't bind to socket: $!" unless $sock;
     }
     $self->{sock} = $sock;
     my $f = Feersum->endjinn;
@@ -41,11 +68,12 @@ sub _prepare {
     }
 
     $self->{endjinn} = $f;
+    return;
 }
 
 # for overriding:
-sub assign_request_handler {
-    $_[0]->{endjinn}->request_handler($_[1]);
+sub assign_request_handler { ## no critic (RequireArgUnpacking)
+    return $_[0]->{endjinn}->request_handler($_[1]);
 }
 
 sub run {
@@ -72,25 +100,27 @@ sub run {
 
     $self->{_quit} = EV::signal 'QUIT', sub { $self->quit };
 
-    $self->pre_fork if $self->{pre_fork};
+    $self->_start_pre_fork if $self->{pre_fork};
     EV::run;
     $self->{quiet} or warn "Feersum [$$]: done\n";
+    $self->DESTROY();
+    return;
 }
 
-sub fork_another {
+sub _fork_another {
     my ($self, $slot) = @_;
     weaken $self;
 
     my $pid = fork;
-    die "failed to fork: $!" unless defined $pid;
+    croak "failed to fork: $!" unless defined $pid;
     unless ($pid) {
         EV::default_loop()->loop_fork;
         $self->{quiet} or warn "Feersum [$$]: starting\n";
         delete $self->{_kids};
         delete $self->{pre_fork};
-        eval { EV::run; };
-        warn $@ if $@;
-        POSIX::exit($@ ? -1 : 0);
+        eval { EV::run; }; ## no critic (RequireCheckingReturnValueOfEval)
+        carp $@ if $@;
+        POSIX::exit($@ ? -1 : 0); ## no critic (ProhibitMagicNumbers)
     }
 
     $self->{_n_kids}++;
@@ -100,23 +130,25 @@ sub fork_another {
             "with rstatus ".$w->rstatus."\n";
         $self->{_n_kids}--;
         if ($self->{_shutdown}) {
-            EV::break(EV::BREAK_ALL) unless $self->{_n_kids};
+            EV::break(EV::BREAK_ALL()) unless $self->{_n_kids};
             return;
         }
-        $self->fork_another();
+        $self->_fork_another();
     };
+    return;
 }
 
-sub pre_fork {
+sub _start_pre_fork {
     my $self = shift;
 
     POSIX::setsid();
 
     $self->{_kids} = [];
     $self->{_n_kids} = 0;
-    $self->fork_another($_) for (1 .. $self->{pre_fork});
+    $self->_fork_another($_) for (1 .. $self->{pre_fork});
 
     $self->{endjinn}->unlisten();
+    return;
 }
 
 sub quit {
@@ -125,12 +157,12 @@ sub quit {
 
     $self->{_shutdown} = 1;
     $self->{quiet} or warn "Feersum [$$]: shutting down...\n";
-    my $death = 5;
+    my $death = DEATH_TIMER;
 
     if ($self->{_n_kids}) {
-        # in parent, broadcast SIGQUIT to the group
-        kill 3, -$$; # kill process group, but not self
-        $death += 2;
+        # in parent, broadcast SIGQUIT to the group (not self)
+        kill 3, -$$; ## no critic (ProhibitMagicNumbers)
+        $death += DEATH_TIMER_INCR;
     }
     else {
         # in child or solo process
@@ -138,6 +170,7 @@ sub quit {
     }
 
     $self->{_death} = EV::timer $death, 0, sub { POSIX::exit(1) };
+    return;
 }
 
 1;
@@ -162,11 +195,16 @@ Feersum::Runner
 
 Much like L<Plack::Runner>, but with far fewer options.
 
-=head1 ATTRIBUTES
-
-The following initialization options are available.
+=head1 METHODS
 
 =over 4
+
+=item C<< Feersum::Runner->new(%params) >>
+
+Returns a Feersum::Runner singleton.  Params are only applied for the first
+invocation.
+
+=over 8
 
 =item listen
 
@@ -181,7 +219,7 @@ the C<run()> method).
 
 =item quiet
 
-Don't be so noisy.
+Don't be so noisy. (default: on)
 
 =item app_file
 
@@ -189,14 +227,21 @@ Load this filename as a native feersum app.
 
 =back
 
-=head1 METHODS
-
-=over 4
-
 =item C<< $runner->run($feersum_app) >>
 
 Run Feersum with the specified app code reference.  Note that this is not a
 PSGI app, but a native Feersum app.
+
+=item C<< $runner->assign_request_handler($subref) >>
+
+For sub-classes to override, assigns an app handler. (e.g.
+L<Plack::Handler::Feersum>).  By default, this assigns a Feersum-native (and
+not PSGI) handler.
+
+=item C<< $runner->quit() >>
+
+Initiate a graceful shutdown.  A signal handler for SIGQUIT will call this
+method.
 
 =back
 

@@ -5,7 +5,7 @@ use warnings;
 use EV ();
 use Carp ();
 
-our $VERSION = '1.202';
+our $VERSION = '1.400';
 
 require Feersum::Connection;
 require Feersum::Connection::Handle;
@@ -14,7 +14,7 @@ XSLoader::load('Feersum', $VERSION);
 
 # numify as per
 # http://www.dagolden.com/index.php/369/version-numbers-should-be-boring/
-$VERSION = eval $VERSION;
+$VERSION = eval $VERSION; ## no critic (StringyEval, ConstantVersion)
 
 our $INSTANCE;
 
@@ -30,12 +30,13 @@ sub new {
 sub use_socket {
     my ($self, $sock) = @_;
     $self->{socket} = $sock;
-    my $fd = fileno($sock);
+    my $fd = fileno $sock;
     $self->accept_on_fd($fd);
 
     my $host = eval { $sock->sockhost() } || 'localhost';
-    my $port = eval { $sock->sockport() } || 80;
+    my $port = eval { $sock->sockport() } || 80; ## no critic (MagicNumbers)
     $self->set_server_name_and_port($host,$port);
+    return;
 }
 
 # overload this to catch Feersum errors and exceptions thrown by request
@@ -356,6 +357,12 @@ These are methods on the global Feersum singleton.
 
 =over 4
 
+=item C<< new() >>
+
+=item C<< endjinn() >>
+
+Returns the C<Feersum> singleton. Takes no parameters.
+
 =item C<< use_socket($sock) >>
 
 Use the file-descriptor attached to a listen-socket to accept connections.
@@ -372,6 +379,10 @@ A reference to C<$sock> is kept as C<< Feersum->endjinn->{socket} >>.
 Use the specified fileno to accept connections.  May be used as an alternative
 to C<use_socket>.
 
+=item C<< unlisten() >>
+
+Stop listening to the socket specified by use_socket or accept_on_fd.
+
 =item C<< request_handler(sub { my $req = shift; ... }) >>
 
 Sets the global request handler.  Any previous handler is replaced.
@@ -383,6 +394,10 @@ be called B<only> after receiving the body in its entirety.  The headers
 *must* specify a Content-Length of the body otherwise the request will be
 rejected.  The maximum size is hard coded to 2147483647 bytes (this may be
 considered a bug).
+
+=item C<< psgi_request_handler(sub { my $env = shift; ... }) >>
+
+Like request_handler, but assigns a PSGI handler instead.
 
 =item C<< read_timeout() >>
 
@@ -438,37 +453,121 @@ waiting for a request entity body).
 Any exceptions thrown in the handler will generate a warning and not
 propagated.
 
+=item C<< set_server_name_and_port($host,$port) >>
+
+Override Feersum's notion of what SERVER_HOST and SERVER_PORT should be.
+
 =back
 
 =cut
 
-=head1 LIMITS
+=head1 GRITTY DETAILS
+
+=head2 Compile Time Options
+
+There are a number of constants at the top of Feersum.xs.  If you change any
+of these, be sure to note that in any bug reports.
 
 =over 4
 
-=item HTTP methods
+=item MAX_HEADERS
 
-Only GET POST PUT DELETE HEAD - others are not supported.
+Defaults to 64.  Controls how many headers can be present in an HTTP request.
 
-=item listening sockets
+If a request exceeds this limit, a 400 response is given and the app handler does not run.
 
-1 - this may be considered a bug
+=item MAX_HEADER_NAME_LEN
 
-=item body length
+Defaults to 128.  Controls how long the name of each header can be.
 
-2147483647 - about 2GiB.
+If a request exceeds this limit, a 400 response is given and the app handler does not run.
 
-=item request headers
+=item MAX_BODY_LEN
 
-64
+Defaults to ~2GB.  Controls how large the body of a POST/PUT/etc. can be when
+that request has a C<Content-Length> header.
 
-=item request header name length
+If a request exceeds this limit, a 413 response is given and the app handler does not run.
 
-128 bytes
+See also BUGS
 
-=item bytes read per read() system call
+=item READ_BUFSZ
 
-4096 bytes
+=item READ_INIT_FACTOR
+
+=item READ_GROW_FACTOR
+
+READ_BUFSZ defaults to 4096, READ_INIT_FACTOR 2 and READ_GROW_FACTOR 8.
+
+Together, these tune how data is read for a request.
+
+Read buffers start out at READ_INIT_FACTOR * READ_BUFSZ bytes.
+If another read is needed and the buffer is under READ_BUFSZ bytes
+then the buffer gets an additional READ_GROW_FACTOR * READ_BUFSZ bytes.
+The trade-off with the grow factor is memory usage vs. system calls.
+
+=item AUTOCORK_WRITES
+
+Controls how response data is written to sockets.  If enabled (the default)
+the event loop is used to wait until the socket is writable, otherwise a write
+is performed immediately.  In either case, non-blocking writes are used.
+Using the event loop is "nicer" but perhaps introduces latency, hence this
+option.
+
+=item FLASH_SOCKET_POLICY_SUPPORT
+
+=item FLASH_SOCKET_POLICY
+
+FLASH_SOCKET_POLICY_SUPPORT defaults to disabled.
+
+When it's enabled, Feersum will detect a Flash C<< <policy-file-request/> >>
+packet and respond with the FLASH_SOCKET_POLICY string.
+
+The default FLASH_SOCKET_POLICY string looks like this:
+
+    <?xml version="1.0"?>
+    <!DOCTYPE cross-domain-policy SYSTEM "/xml/dtds/cross-domain-policy.dtd">
+    <cross-domain-policy>
+      <site-control permitted-cross-domain-policies="master-only"/>
+      <allow-access-from domain="*" to-ports="*" secure="false"/>
+    </cross-domain-policy>
+
+Since that's fairly wide-open, you may not wish to enable
+FLASH_SOCKET_POLICY_SUPPORT.
+
+Note that this feature likely won't work if you use a front-end HTTP server
+(e.g. nginx) since the request isn't valid HTTP.
+
+=item FEERSUM_IOMATRIX_SIZE
+
+Controls the size of the main write-buffer structure in Feersum.  Making this
+value lower will use slightly less memory per connection at the cost of speed
+(and vice-versa for raising the value).  The effect is most noticeable when
+you're app is making a lot of sparce writes.  The default of 64 generally
+keeps usage under 4k per connection on full 64-bit platforms when you take
+into account the other connection and request structures. 
+
+B<NOTE>: FEERSUM_IOMATRIX_SIZE cannot exceed your OS's defined IOV_MAX or
+UIO_MAXIOV constant.  Solaris defines IOV_MAX to be 16, making it the default
+on that platform.  Linux and OSX seem to set this at 1024.
+
+=item FEERSUM_STEAL
+
+For non-threaded perls >= 5.12.0, this defaults to enabled.
+
+When enabled, Feersum will "steal" the contents of temporary lexical scalars
+used for response bodies.  The scalars become C<undef> as a result, but due to
+them being temps they likely aren't used again anyway.  Stealing saves the
+time and memory needed to make a copy of that scalar, resulting in a mild to
+moderate performance boost.
+
+This egregious hack only extends to non-magical, string, C<PADTMP> scalars.
+
+If it breaks for your new version of perl, please send stash a note (or a pull
+request!) on github.
+
+Worth noting is that a similar zero-copy effect can be achieved by using the
+C<psgix.body.scalar_refs> feature.
 
 =back
 
@@ -478,10 +577,10 @@ Please report bugs using http://github.com/stash/Feersum/issues/
 
 Keep-alive is ignored completely.
 
-Currently there's no way to limit the request entity length of a POST/PUT/etc.
-This could lead to a DoS attack on a Feersum server.  Suggested remedy is to
-only run Feersum behind some other web server and to use that to limit the
-entity size.
+Currently there's no way to limit the request entity length of a B<streaming>
+POST/PUT/etc.  This could lead to a DoS attack on a Feersum server.  Suggested
+remedy is to only run Feersum behind some other web server and to use that to
+limit the entity size.
 
 Although not explicitly a bug, the following may cause undesirable behavior.
 Feersum will have set SIGPIPE to be ignored by the time your handler gets
@@ -518,9 +617,13 @@ Hans Dieter Pearcey (confound) for docs and packaging guidance.
 
 For bug reports: Chia-liang Kao (clkao), Lee Aylward (leedo)
 
+Audrey Tang (au) for flash socket policy support.
+
 =head1 COPYRIGHT AND LICENSE
 
-Copyright (C) 2010 by Jeremy Stashewsky & Socialtext Inc.
+Copyright (C) 2011 by Jeremy Stashewsky
+
+Portions Copyright (C) 2010 Socialtext Inc.
 
 This library is free software; you can redistribute it and/or modify
 it under the same terms as Perl itself, either Perl version 5.8.7 or,

@@ -1,4 +1,5 @@
 package Feersum::Connection;
+use warnings;
 use strict;
 use Carp qw/croak/;
 use IO::Socket::INET;
@@ -28,23 +29,24 @@ sub initiate_streaming {
 
 sub _initiate_streaming_psgi {
     my ($self, $streamer) = @_;
-    $streamer->(sub { $self->_continue_streaming_psgi(@_) });
+    return $streamer->(sub { $self->_continue_streaming_psgi(@_) });
 }
 
-sub _raw {
+my $_pkg = "Feersum::";
+sub _raw { ## no critic (RequireArgUnpacking)
     # don't shift; want to modify $_[0] directly.
     my $fileno = $_[1];
+    my $name = "RAW$fileno";
     # Hack to make gensyms via new_from_fd() show up in the Feersum package.
     # This may or may not save memory (HEKs?) over true gensyms.
     no warnings 'redefine';
     local *IO::Handle::gensym = sub {
         no strict;
-        my $pkg = "Feersum::";
-        my $name = "RAW$fileno";
-        my $gv = \*{$pkg.$name};
-        delete $$pkg{$name};
+        my $gv = \*{$_pkg.$name};
+        delete $$_pkg{$name};
         $gv;
     };
+    # Replace $_[0] directly:
     $_[0] = IO::Socket::INET->new_from_fd($fileno, '+<');
     # after this, Feersum will use PerlIO_unread to put any remainder data
     # into the socket.
@@ -149,6 +151,34 @@ socket is closed.  A "guard" in this context is some object that will do
 something interesting in its DESTROY/DEMOLISH method. For example, L<Guard>.
 
 =back
+
+=begin comment
+
+=head2 Private and or Deprecated Methods
+
+=over 4
+
+=item C<< new() >>
+
+No-op. Feersum will create these objects internally.
+
+=item C<< $req->read_handle >>
+
+use psgi.input instead
+
+=item C<< $req->write_handle >>
+
+=item C<< $req->start_response(...) >>
+
+use start_streaming() or start_whole_response() instead
+
+=item C<< $req->initiate_streaming(...) >>
+
+use start_streaming() and its return value instead
+
+=back
+
+=end comment
 
 =head1 AUTHOR
 

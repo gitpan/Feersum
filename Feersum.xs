@@ -11,6 +11,37 @@
 
 #include "ppport.h"
 
+
+///////////////////////////////////////////////////////////////
+// "Compile Time Options" - See Feersum.pm POD for information
+
+#define MAX_HEADERS 64
+#define MAX_HEADER_NAME_LEN 128
+#define MAX_BODY_LEN 2147483647
+
+#define READ_BUFSZ 4096
+#define READ_INIT_FACTOR 2
+#define READ_GROW_FACTOR 8
+
+#define AUTOCORK_WRITES 1
+
+#if 0
+# define FLASH_SOCKET_POLICY_SUPPORT
+# define FLASH_SOCKET_POLICY "<?xml version=\"1.0\"?>\n<!DOCTYPE cross-domain-policy SYSTEM \"/xml/dtds/cross-domain-policy.dtd\">\n<cross-domain-policy>\n<site-control permitted-cross-domain-policies=\"master-only\"/>\n<allow-access-from domain=\"*\" to-ports=\"*\" secure=\"false\"/>\n</cross-domain-policy>\n"
+#endif
+
+// may be lower for your platform (e.g. Solaris is 16).  See POD.
+#define FEERSUM_IOMATRIX_SIZE 64
+
+// auto-detected in Makefile.PL by perl versions and ithread usage; override
+// that here. See POD for details.
+#if 0
+# undef FEERSUM_STEAL
+#endif
+
+///////////////////////////////////////////////////////////////
+
+
 #ifdef __GNUC__
 # define likely(x)   __builtin_expect(!!(x), 1)
 # define unlikely(x) __builtin_expect(!!(x), 0)
@@ -50,23 +81,6 @@
 #define Sz unsigned Sz_t
 #define Ssz Sz_t
 
-// if you change these, also edit the LIMITS section in the POD
-#define MAX_HEADERS 64
-#define MAX_HEADER_NAME_LEN 128
-#define MAX_BODY_LENGTH 2147483647
-
-// Read buffers start out at READ_INIT_FACTOR * READ_BUFSZ bytes.
-// If another read is needed and the buffer is under READ_BUFSZ bytes
-// then the buffer gets an additional READ_GROW_FACTOR * READ_BUFSZ bytes.
-// The trade-off with the grow factor is memory usage vs. system calls.
-#define READ_BUFSZ 4096
-#define READ_INIT_FACTOR 2
-#define READ_GROW_FACTOR 8
-
-// Setting this to true will wait for writability before calling write() (will
-// try to immediately write otherwise)
-#define AUTOCORK_WRITES 1
-
 #define WARN_PREFIX "Feersum: "
 
 #ifndef DEBUG
@@ -102,10 +116,13 @@
 #include "rinq.c"
 
 // Check FEERSUM_IOMATRIX_SIZE against what's actually usable on this
-// platform.  See $iomatrix_size in Makefile.PL for the default.
-#if FEERSUM_IOMATRIX_SIZE > IOV_MAX
+// platform. See Feersum.pm for an explanation
+#if defined(IOV_MAX) && FEERSUM_IOMATRIX_SIZE > IOV_MAX
 # undef FEERSUM_IOMATRIX_SIZE
 # define FEERSUM_IOMATRIX_SIZE IOV_MAX
+#elif defined(UIO_MAXIOV) && FEERSUM_IOMATRIX_SIZE > UIO_MAXIOV
+# undef FEERSUM_IOMATRIX_SIZE
+# define FEERSUM_IOMATRIX_SIZE UIO_MAXIOV
 #endif
 
 struct iomatrix {
@@ -325,12 +342,10 @@ add_sv_to_wbuf(struct feer_conn *c, SV *sv)
     else if (unlikely(SvPADTMP(sv))) {
         // PADTMPs have their PVs re-used, so we can't simply keep a
         // reference.  TEMPs maybe behave in a similar way and are potentially
-        // stealable.
+        // stealable.  If not stealing, we must make a copy.
 #ifdef FEERSUM_STEAL
         if (SvFLAGS(sv) == SVs_PADTMP|SVf_POK|SVp_POK) {
             trace3("STEALING\n");
-            // XXX: EGREGIOUS HACK THAT MAKES THINGS A LOT FASTER
-            // steal the PV from a PADTMP PV
             SV *theif = newSV(0);
             sv_upgrade(theif, SVt_PV);
 
@@ -349,11 +364,9 @@ add_sv_to_wbuf(struct feer_conn *c, SV *sv)
             sv = theif;
         }
         else {
-            // be safe and just make a copy
             sv = newSVsv(sv);
         }
 #else
-        // Make a simple copy (which duplicates the PV almost all of the time)
         sv = newSVsv(sv);
 #endif
     }
@@ -926,9 +939,13 @@ try_parse_http(struct feer_conn *c, size_t last_read)
     struct feer_req *req = c->req;
     if (likely(!req)) {
         Newxz(req,1,struct feer_req);
-        req->num_headers = MAX_HEADERS;
         c->req = req;
     }
+
+    // GH#12 - incremental parsing sets num_headers to 0 each time; force it
+    // back on every invocation
+    req->num_headers = MAX_HEADERS;
+
     return phr_parse_request(SvPVX(c->rbuf), SvCUR(c->rbuf),
         &req->method, &req->method_len,
         &req->path, &req->path_len, &req->minor_version,
@@ -987,6 +1004,31 @@ try_conn_read(EV_P_ ev_io *w, int revents)
     SvCUR(c->rbuf) += got_n;
     // likely = optimize for small requests
     if (likely(c->receiving == RECEIVE_HEADERS)) {
+
+#ifdef FLASH_SOCKET_POLICY_SUPPORT
+        if (unlikely(*SvPVX(c->rbuf) == '<')) {
+            if (likely(SvCUR(c->rbuf) >= 22)) { // length of vvv
+                if (str_eq(SvPVX(c->rbuf), 22, "<policy-file-request/>", 22)) {
+                    add_const_to_wbuf(c, STR_WITH_LEN(FLASH_SOCKET_POLICY));
+                    conn_write_ready(c);
+                    stop_read_watcher(c);
+                    stop_read_timer(c);
+                    // TODO: keep-alives: be sure to remove the 22 bytes
+                    // out of the rbuf
+                    change_receiving_state(c, RECEIVE_SHUTDOWN);
+                    change_responding_state(c, RESPOND_SHUTDOWN);
+                    goto dont_read_again;
+                }
+            }
+            // "if prefixed with"
+            else if (likely(str_eq(SvPVX(c->rbuf), SvCUR(c->rbuf),
+                                   "<policy-file-request/>", SvCUR(c->rbuf))))
+            {
+                goto try_read_again;
+            }
+        }
+#endif
+
         int ret = try_parse_http(c, (size_t)got_n);
         if (ret == -1) goto try_read_bad;
         if (ret == -2) goto try_read_again;
@@ -1219,7 +1261,7 @@ process_request_headers (struct feer_conn *c, int body_offset)
         {
             int g = grok_number(hdr->value, hdr->value_len, &expected);
             if (likely(g == IS_NUMBER_IN_UV)) {
-                if (unlikely(expected > MAX_BODY_LENGTH)) {
+                if (unlikely(expected > MAX_BODY_LEN)) {
                     err_code = 413;
                     err = "Content length exceeds maximum\n";
                     goto got_bad_request;
@@ -1946,8 +1988,6 @@ call_request_callback (struct feer_conn *c)
 
     trace("leaving request callback\n");
     PUTBACK;
-    FREETMPS;
-    LEAVE;
 
     if (request_cb_is_psgi && likely(returned >= 1)) {
         feersum_handle_psgi_response(aTHX_ c, psgi_response, 1); // can_recurse
@@ -1956,6 +1996,9 @@ call_request_callback (struct feer_conn *c)
 
     c->in_callback--;
     SvREFCNT_dec(c->self);
+
+    FREETMPS;
+    LEAVE;
 }
 
 static void
