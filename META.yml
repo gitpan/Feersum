@@ -1,37 +1,37 @@
---- #YAML:1.0
-name:               Feersum
-version:            1.400
-abstract:           A PSGI engine for Perl based on EV/libev
+---
+abstract: 'A PSGI engine for Perl based on EV/libev'
 author:
-    - Jeremy Stashewsky <stash@cpan.org>
-license:            perl
-distribution_type:  module
-configure_requires:
-    EV:                   4
-    ExtUtils::MakeMaker:  6.51
+  - 'Jeremy Stashewsky <stash@cpan.org>'
 build_requires:
-    AnyEvent:     5.261
-    Guard:        1.012
-    Test::Fatal:  0.003
-    Test::More:   0.94
-requires:
-    EV:            4
-    Scalar::Util:  1.19
-resources:
-    license:     http://dev.perl.org/licenses/
-    repository:  git://github.com/stash/Feersum.git
-no_index:
-    directory:
-        - t
-        - inc
-        - eg
-        - picohttpparser-git
-generated_by:       ExtUtils::MakeMaker version 6.56
+  AnyEvent: 5.261
+  Guard: 1.012
+  Test::Fatal: 0.003
+  Test::More: 0.94
+  Test::TCP: 1.12
+configure_requires:
+  EV: 4
+  ExtUtils::MakeMaker: 6.51
+dynamic_config: 1
+generated_by: 'ExtUtils::MakeMaker version 6.66, CPAN::Meta::Converter version 2.120921'
+license: perl
 meta-spec:
-    url:      http://module-build.sourceforge.net/META-spec-v1.4.html
-    version:  1.4
+  url: http://module-build.sourceforge.net/META-spec-v1.4.html
+  version: 1.4
+name: Feersum
+no_index:
+  directory:
+    - t
+    - inc
+    - eg
+    - picohttpparser-git
 recommends:
-    JSON::XS:         2
-    Plack:            0.995
-    Test::LeakTrace:  0.13
-    Test::TCP:        1.12
+  Test::LeakTrace: 0.13
+requires:
+  EV: 4
+  JSON::XS: 2
+  Plack: 0.995
+  Scalar::Util: 1.19
+resources:
+  license: http://dev.perl.org/licenses/
+  repository: git://github.com/stash/Feersum.git
+version: 1.401
